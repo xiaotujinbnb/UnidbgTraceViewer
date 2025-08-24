@@ -660,6 +660,10 @@ class TraceViewer(QtWidgets.QMainWindow):
     def load_trace(self, path: str) -> None:
         """异步加载并解析指定 trace 文件，避免卡顿，完成后刷新界面。"""
         self.statusBar().showMessage('正在解析… 0%')
+        # 切换新文件时重置 UI，避免旧内容混淆
+        self.func_list.clear()
+        self.code_edit.setPlainText('')
+        self.reg_table.setRowCount(0)
         self.func_list.setDisabled(True)
         self.code_edit.setDisabled(True)
         self.reg_table.setDisabled(True)

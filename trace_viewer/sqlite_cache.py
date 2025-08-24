@@ -1,4 +1,5 @@
 import os
+import sys
 import sqlite3
 import hashlib
 from typing import Iterable, Optional, Tuple
@@ -49,10 +50,17 @@ class SQLiteCache:
 
     def __init__(self, trace_path: str) -> None:
         self.trace_path = os.path.abspath(trace_path)
-        cache_dir = os.path.join(os.path.dirname(self.trace_path), ".trace_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        # 将缓存移出项目目录，使用系统级缓存目录
+        if sys.platform.startswith('darwin'):
+            base_cache = os.path.expanduser('~/Library/Caches/UnidbgTraceViewer')
+        else:
+            xdg = os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+            base_cache = os.path.join(xdg, 'unidbg-trace-tools')
+        os.makedirs(base_cache, exist_ok=True)
         base = os.path.basename(self.trace_path)
-        self.db_path = os.path.join(cache_dir, f"{base}.sqlite")
+        # 避免同名文件冲突：加入路径哈希前缀
+        path_hash = hashlib.sha1(self.trace_path.encode('utf-8')).hexdigest()[:10]
+        self.db_path = os.path.join(base_cache, f"{base}.{path_hash}.sqlite")
         # 使用 detect_types=0、isolation_level=None 提高性能；调用方显式事务
         self.conn = sqlite3.connect(self.db_path, isolation_level=None, detect_types=0)
         self.conn.execute("PRAGMA foreign_keys=OFF;")
