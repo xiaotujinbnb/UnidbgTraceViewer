@@ -137,9 +137,8 @@ class TraceViewer(QtWidgets.QMainWindow):
         self.vf_dock.jumpToEvent.connect(self._jump_to_event_index)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.vf_dock)
 
-        # 内存写入对比面板
-        self.mem_dock = MemoryDiffDock(self)
-        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.mem_dock)
+        # 内存写入对比面板（禁用以避免卡顿）
+        self.mem_dock = None
 
         # 颜色区分寄存器（简单规则，可扩展）
         self._color_map = {
@@ -152,6 +151,8 @@ class TraceViewer(QtWidgets.QMainWindow):
         # 右键值流追踪：异步链路计算
         self._chain_worker = None
         self._chain_req_id = 0
+        # 异步寄存器复原
+        self._regs_worker = None
 
         # 菜单：文件->打开
         self._build_menu()
@@ -172,6 +173,17 @@ class TraceViewer(QtWidgets.QMainWindow):
             self.load_trace(trace_path)
         else:
             QtCore.QTimer.singleShot(0, self.open_file_dialog)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # 确保后台线程安全退出，避免 QThread 警告
+        try:
+            for t in [getattr(self, '_regs_worker', None), getattr(self, '_chain_worker', None), getattr(self, '_worker', None)]:
+                if t and t.isRunning():
+                    t.requestInterruption()
+                    t.wait(200)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def _on_func_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
         addr = item.data(0, QtCore.Qt.UserRole)
@@ -198,11 +210,9 @@ class TraceViewer(QtWidgets.QMainWindow):
             return
         # 刷新代码窗口与寄存器窗口
         self._render_code_at(ev_idx)
-        before = self.parser.reconstruct_regs_at(ev_idx - 1) if ev_idx > 0 else {}
-        after = self.parser.reconstruct_regs_at(ev_idx)
-        self._render_regs(before, after)
+        self._rebuild_regs_async(ev_idx)
         # 内存对比
-        self.mem_dock.update_for_event(ev_idx)
+        # 内存对比禁用
 
     def _jump_to_event_index(self, ev_idx: int) -> None:
         """根据事件索引跳转（供值流面板调用）。"""
@@ -210,9 +220,7 @@ class TraceViewer(QtWidgets.QMainWindow):
             return
         ev_idx = max(0, min(ev_idx, len(self.parser.events) - 1))
         self._render_code_at(ev_idx)
-        before = self.parser.reconstruct_regs_at(ev_idx - 1) if ev_idx > 0 else {}
-        after = self.parser.reconstruct_regs_at(ev_idx)
-        self._render_regs(before, after)
+        self._rebuild_regs_async(ev_idx)
 
     def _render_code_at(self, event_index: int, context_window: int = 80) -> None:
         if not self.parser:
@@ -230,8 +238,7 @@ class TraceViewer(QtWidgets.QMainWindow):
         # 高亮当前行
         self._current_code_row = max(0, event_index - start)
         self._highlight_code_line(self._current_code_row)
-        # 同步内存对比
-        self.mem_dock.update_for_event(event_index)
+        # 内存对比改为在寄存器复原完成后异步更新，避免主线程卡顿
 
     def _render_regs(self, regs_before: dict, regs_after: dict) -> None:
         # 将寄存器按“常见顺序”展示，未出现的追加在后
@@ -309,10 +316,8 @@ class TraceViewer(QtWidgets.QMainWindow):
         # 同步代码高亮到点击行
         self._current_code_row = row
         self._highlight_code_line(row)
-        before = self.parser.reconstruct_regs_at(ev_idx - 1) if ev_idx > 0 else {}
-        after = self.parser.reconstruct_regs_at(ev_idx)
-        self._render_regs(before, after)
-        self.mem_dock.update_for_event(ev_idx)
+        self._rebuild_regs_async(ev_idx)
+        # 内存对比禁用
 
     def _on_code_context(self, pos: QtCore.QPoint) -> None:
         if not self.parser or not hasattr(self, '_current_code_start'):
@@ -475,6 +480,33 @@ class TraceViewer(QtWidgets.QMainWindow):
             return
         self._render_chain_list(reg, indices)
         self._jump_to_event_index(indices[0])
+
+    # =========== 异步寄存器复原，避免 UI 卡顿 ==========
+    def _rebuild_regs_async(self, ev_idx: int) -> None:
+        if not self.parser:
+            return
+        try:
+            if self._regs_worker and self._regs_worker.isRunning():
+                self._regs_worker.requestInterruption()
+                self._regs_worker.wait(50)
+        except Exception:
+            pass
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self._regs_worker = RegsWorker(self.parser, ev_idx, self)
+        self._regs_worker.finishedWithIndex.connect(self._on_regs_ready)
+        self._regs_worker.start()
+
+    def _on_regs_ready(self, before: dict, after: dict, ev_idx: int) -> None:
+        QtWidgets.QApplication.restoreOverrideCursor()
+        # 渲染寄存器；若期间用户已跳转到其它行，也仍然渲染最新计算结果
+        self._render_regs(before, after)
+        # 渲染完成后再刷新内存对比，避免在点击当下阻塞
+        try:
+            if self.mem_dock:
+                self.mem_dock.update_for_event(ev_idx)
+        except Exception:
+            pass
+        self._regs_worker = None
 
     def _render_chain_list(self, reg: str, chain: list) -> None:
         if not self.parser:
@@ -663,9 +695,8 @@ class TraceViewer(QtWidgets.QMainWindow):
         self.statusBar().showMessage(
             f'解析完成：{os.path.basename(path)}，事件 {len(self.parser.events)} 条，函数候选 {len(self.parser.branch_targets)} 个')
 
-        # 将解析器与地址求值函数注入侧边面板
-        self.vf_dock.attach(self.parser, self._eval_effective_address)
-        self.mem_dock.attach(self.parser, self._eval_effective_address)
+        # 将解析器与地址求值函数注入侧边面板：改用解析器的预计算地址
+        self.vf_dock.attach(self.parser, lambda idx: self.parser.effective_address(idx))
 
         # 后台写入 SQLite 缓存，不阻塞 UI
         try:
@@ -736,6 +767,26 @@ class AssemblyHighlighter(QtGui.QSyntaxHighlighter):
         for m in self.re_reg.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), self.f_reg)
 
+class RegsWorker(QtCore.QThread):
+    """后台复原寄存器，防止 UI 卡顿。"""
+
+    finishedWithIndex = QtCore.pyqtSignal(dict, dict, int)
+
+    def __init__(self, parser: 'TraceParser', ev_idx: int, parent=None) -> None:
+        super().__init__(parent)
+        self._parser = parser
+        self._ev_idx = ev_idx
+
+    def run(self) -> None:
+        try:
+            before = self._parser.reconstruct_regs_at(self._ev_idx - 1) if self._ev_idx > 0 else {}
+            after = self._parser.reconstruct_regs_at(self._ev_idx)
+        except Exception:
+            before, after = {}, {}
+        if not self.isInterruptionRequested():
+            self.finishedWithIndex.emit(before, after, self._ev_idx)
+
+
 class ParserWorker(QtCore.QThread):
     """后台解析线程，避免主线程卡顿。"""
 
@@ -804,3 +855,5 @@ if __name__ == '__main__':
     sys.exit(main())
 
 
+
+ 

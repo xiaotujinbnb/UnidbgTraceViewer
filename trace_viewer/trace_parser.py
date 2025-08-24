@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable
 import threading
 import time
+from collections import OrderedDict
 
 
 @dataclass
@@ -66,6 +67,9 @@ class TraceParser:
         # 寄存器读写倒排索引
         self.reg_read_index: Dict[str, List[int]] = {}
         self.reg_write_index: Dict[str, List[int]] = {}
+        # 寄存器复原 LRU 缓存
+        self._regs_cache: "OrderedDict[int, Dict[str, int]]" = OrderedDict()
+        self._regs_cache_cap: int = 1024
 
     def parse_file(self, path: str, progress_cb: Optional[callable] = None) -> None:
         """解析 trace 文件并构建索引；若存在可用 SQLite 缓存则直接加载。"""
@@ -355,29 +359,52 @@ class TraceParser:
             return {}
         event_index = max(0, min(event_index, len(self.events) - 1))
 
-        # 查找小于等于目标行号的最近快照
-        target_line = self.events[event_index].line_no
-        checkpoint_line = 0
-        for ln in sorted(self._reg_checkpoints.keys()):
-            if ln <= target_line:
-                checkpoint_line = ln
-            else:
-                break
+        # LRU 缓存命中
+        cached = self._regs_cache.get(event_index)
+        if cached is not None:
+            # 移动到尾部（最新）
+            self._regs_cache.move_to_end(event_index)
+            return cached
 
-        regs = dict(self._reg_checkpoints.get(checkpoint_line, {}))
+        # 优先：从最近缓存的“精确或之前的”事件状态开始，减少回放成本
+        cached_start_idx = None
+        cached_regs = None
+        if self._regs_cache:
+            best_key = -1
+            for k in self._regs_cache.keys():
+                if k <= event_index and k > best_key:
+                    best_key = k
+            if best_key >= 0:
+                cached_start_idx = best_key
+                cached_regs = self._regs_cache[best_key]
 
-        # 从快照位置回放到目标事件
-        start_idx = 0
-        if checkpoint_line:
-            # 寻找快照行号对应的事件起始索引
-            lo, hi = 0, len(self.events) - 1
-            while lo <= hi:
-                mid = (lo + hi) // 2
-                if self.events[mid].line_no < checkpoint_line:
-                    lo = mid + 1
+        if cached_regs is not None:
+            regs = dict(cached_regs)
+            start_idx = cached_start_idx + 1
+        else:
+            # 查找小于等于目标行号的最近快照
+            target_line = self.events[event_index].line_no
+            checkpoint_line = 0
+            for ln in sorted(self._reg_checkpoints.keys()):
+                if ln <= target_line:
+                    checkpoint_line = ln
                 else:
-                    hi = mid - 1
-            start_idx = lo
+                    break
+
+            regs = dict(self._reg_checkpoints.get(checkpoint_line, {}))
+
+            # 从快照位置回放到目标事件
+            start_idx = 0
+            if checkpoint_line:
+                # 寻找快照行号对应的事件起始索引
+                lo, hi = 0, len(self.events) - 1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    if self.events[mid].line_no < checkpoint_line:
+                        lo = mid + 1
+                    else:
+                        hi = mid - 1
+                start_idx = lo
 
         for idx in range(start_idx, event_index + 1):
             ev = self.events[idx]
@@ -387,6 +414,13 @@ class TraceParser:
             if ev.writes:
                 regs.update(ev.writes)
 
+        # 写入缓存并裁剪容量
+        self._regs_cache[event_index] = regs
+        if len(self._regs_cache) > self._regs_cache_cap:
+            try:
+                self._regs_cache.popitem(last=False)
+            except Exception:
+                self._regs_cache.clear()
         return regs
 
     def find_first_event_by_pc(self, pc: int) -> Optional[int]:

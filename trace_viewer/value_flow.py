@@ -48,6 +48,8 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.list.setColumnWidth(8, 150)
         self.list.itemDoubleClicked.connect(self._on_double)
         self.list.itemClicked.connect(self._on_click)
+        # 避免快速重复点击造成阻塞：节流
+        self._last_jump_ts = 0.0
 
         layout.addLayout(form)
         layout.addWidget(self.list)
@@ -78,6 +80,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
 
     def attach(self, parser, eval_effaddr_cb) -> None:
         self.parser = parser
+        # 内存对比已禁用，这里保留接口但不使用 eval_effaddr_cb
         self.eval_effaddr_cb = eval_effaddr_cb
 
     def _on_search(self) -> None:
@@ -153,11 +156,18 @@ class ValueFlowDock(QtWidgets.QDockWidget):
 
     def _on_double(self, item: QtWidgets.QTreeWidgetItem, col: int) -> None:
         idx = item.data(0, QtCore.Qt.UserRole)
-        if isinstance(idx, int):
-            self.jumpToEvent.emit(idx)
+        if not isinstance(idx, int):
+            return
+        # 简单节流：两次跳转间隔 >= 80ms
+        import time as _t
+        now = _t.perf_counter()
+        if now - getattr(self, '_last_jump_ts', 0.0) < 0.08:
+            return
+        self._last_jump_ts = now
+        self.jumpToEvent.emit(idx)
 
     def _on_click(self, item: QtWidgets.QTreeWidgetItem, col: int) -> None:
-        # 单击也跳转，便于快速观察寄存器面板随行变化
+        # 单击也跳转，便于快速观察寄存器面板随行变化（同样使用节流）
         self._on_double(item, col)
 
     # === 值路径追踪 ===
@@ -602,9 +612,30 @@ class ChainWorker(QtCore.QThread):
         self._match_val = match_val
         self._side = side
         self._req_id = req_id
+        self._deadline_ms = 300  # 构链时间预算，超时提前返回
 
     def run(self) -> None:
-        indices = self._parser.build_value_chain_fast(self._reg, self._start_idx, self._match_val, self._side)
+        # 带时间预算的构链：分阶段推进，超时返回阶段结果
+        import time as _t
+        t0 = _t.perf_counter()
+        indices: list[int] = []
+        try:
+            # 1) 找 writer 与最近读取
+            prelim = self._parser.build_value_chain_fast(self._reg, self._start_idx, self._match_val, self._side)
+            indices.extend(prelim[:128])  # 初步限制规模
+            if (_t.perf_counter() - t0) * 1000 >= self._deadline_ms:
+                if not self.isInterruptionRequested():
+                    self.finishedWithId.emit(sorted(set(indices)), self._reg, self._req_id)
+                return
+            # 2) 若时间允许，继续扩展后续同值写入段
+            if len(prelim) >= 128:
+                more = prelim[128:256]
+                indices.extend(more)
+        except Exception:
+            pass
+        if self.isInterruptionRequested():
+            return
+        self.finishedWithId.emit(sorted(set(indices)), self._reg, self._req_id)
         if self.isInterruptionRequested():
             return
         self.finishedWithId.emit(indices, self._reg, self._req_id)
