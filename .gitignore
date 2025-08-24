@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE/editor
+.idea/
+.vscode/
+
+# Trace viewer cache
+**/.trace_cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+trace_viewer/fanqie_trace.txt
+
+
+# Docs
+*.mdc
