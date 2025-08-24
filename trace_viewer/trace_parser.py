@@ -42,16 +42,16 @@ class TraceParser:
         r"(?P<pc>0x[0-9a-fA-F]+):\s+\"(?P<asm>[^\"]+)\"(?P<rest>.*)$"
     )
 
-    # 寄存器匹配：ARM32 的 r0..r15, sp, lr, pc, cpsr；也兼容 ARM64 的 x0..x30
-    REG_PAIR_RE = re.compile(r"\b([rx][0-9]{1,2}|sp|lr|pc|cpsr)=0x[0-9a-fA-F]+\b")
-    REG_NAME_RE = re.compile(r"^([rx][0-9]{1,2}|sp|lr|pc|cpsr)=")
+    # 寄存器匹配：ARM32 的 r0..r15, sp, lr, pc, cpsr；兼容 ARM64 的 x0..x30 及 w0..w30
+    REG_PAIR_RE = re.compile(r"\b([rxw][0-9]{1,2}|sp|lr|pc|cpsr)=0x[0-9a-fA-F]+\b")
+    REG_NAME_RE = re.compile(r"^([rxw][0-9]{1,2}|sp|lr|pc|cpsr)=")
     HEX_RE = re.compile(r"0x[0-9a-fA-F]+")
 
     BRANCH_TARGET_RE = re.compile(r"\b(b|bl|beq|bne|bhi|blo|bge|blt|bpl|bmi)\s+#?(0x[0-9a-fA-F]+)\b")
     ADD_PC_TARGET_RE = re.compile(r"\badd\s+pc,\s*(r\d+|x\d+),\s*(r\d+|x\d+|#?0x[0-9a-fA-F]+)\b")
     DIRECT_ADDR_RE = re.compile(r"\b(0x[0-9a-fA-F]+)\b")
 
-    def __init__(self, checkpoint_interval: int = 2000) -> None:
+    def __init__(self, checkpoint_interval: int = 2000, arch_hint: str = 'auto') -> None:
         """初始化解析器。
 
         checkpoint_interval：每隔多少行保存一次寄存器快照，用于加速寄存器复原。"""
@@ -67,6 +67,8 @@ class TraceParser:
         # 寄存器读写倒排索引
         self.reg_read_index: Dict[str, List[int]] = {}
         self.reg_write_index: Dict[str, List[int]] = {}
+        # 架构提示：'auto'/'arm32'/'arm64'
+        self.arch: str = arch_hint if arch_hint in ('auto', 'arm32', 'arm64') else 'auto'
         # 寄存器复原 LRU 缓存
         self._regs_cache: "OrderedDict[int, Dict[str, int]]" = OrderedDict()
         self._regs_cache_cap: int = 1024
@@ -326,7 +328,14 @@ class TraceParser:
                     val = int(val_m.group(0), 16)
                 except ValueError:
                     continue
-                target[name.lower()] = val
+                lname = name.lower()
+                target[lname] = val
+                # 基于寄存器名推断架构（仅在 auto 模式）
+                if self.arch == 'auto':
+                    if lname.startswith('x') or lname.startswith('w'):
+                        self.arch = 'arm64'
+                    elif lname.startswith('r') and self.arch != 'arm64':
+                        self.arch = 'arm32'
 
         return reads, writes
 
@@ -597,10 +606,10 @@ class TraceParser:
         def getv(rname: str):
             return regs.get(rname.strip().lower())
 
-        # [r0]
-        if ',' not in expr and expr.startswith('r'):
+        # [r0] / [x0] / [w0]
+        if ',' not in expr and (expr.startswith('r') or expr.startswith('x') or expr.startswith('w')):
             return getv(expr)
-        # [r0, #imm]
+        # [r0, #imm] / [x0, #imm]
         if ', #' in expr:
             try:
                 base, imm = [x.strip() for x in expr.split(', #', 1)]
@@ -614,8 +623,8 @@ class TraceParser:
             except Exception:
                 return None
             return (b + off) & 0xFFFFFFFF
-        # [r0, r2, lsl #2]
-        if ', r' in expr and 'lsl' in expr:
+        # [r0, r2, lsl #2] / [x0, x2, lsl #2] / [x0, w2, lsl #2]
+        if (', r' in expr or ', x' in expr or ', w' in expr) and 'lsl' in expr:
             parts = expr.split(',')
             if len(parts) < 3:
                 return None
