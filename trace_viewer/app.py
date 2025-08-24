@@ -187,7 +187,7 @@ class TraceViewer(QtWidgets.QMainWindow):
             pass
         # 清理忙碌光标
         while getattr(self, '_busy_count', 0) > 0:
-            self._busy(False)
+            _busy(self, False)
         super().closeEvent(event)
 
     def _on_func_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
