@@ -1,0 +1,53 @@
+---
+description: trace-viewer-usage
+---
+# Unidbg Trace Viewer 使用提示
+
+- 启动：`python3.8 -m trace_viewer.app [trace.txt]`
+- 打开文件：菜单“文件-打开”或顶部地址栏跳转。
+- 值流追踪：
+  - 面板输入寄存器和值（十六进制）点击“追踪”，或在代码窗口右键“指定值追踪”。
+  - 候选唯一自动进入；多候选弹窗选择行号。
+  - 点击结果列表行跳转（带轻量节流）。
+- 性能：寄存器复原/链路构建走后台线程；内存对比默认禁用。
+---
+alwaysApply: false
+description: Unidbg Trace Viewer 使用指南（外部工具仓库）
+---
+# Unidbg Trace Viewer 使用指南（外部工具）
+
+本规则概述外部工具仓库 “unidbg-trace-tools” 中的 GUI：Trace Viewer。用于解析 `unidbg` 生成的 trace 文本，支持交互跳转、寄存器前/后对比、值流追踪、内存写入对比与导出 Python 回放代码等功能。
+
+> 提示：本仓库不再包含该工具代码。请前往外部工具仓库获取与运行。
+
+## 启动
+
+- 源码方式：
+  - 进入工具仓库根目录运行：`python3.8 -m trace_viewer.app`
+- 安装方式：
+  - 安装后提供命令：`trace-viewer`
+
+## 打开与导航
+
+- 通过“文件 -> 打开”选择 trace 文本（例如：[unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt](mdc:unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt)）。
+- 左侧“函数”面板点击目标地址，右侧“代码”面板会跳转并仅显示汇编助记符与操作数。
+- 代码面板中点击如 `b 0x12025890` 的地址，可直接跳转到对应执行位置，并同步刷新“寄存器”和“内存写入对比”视图。
+
+## 主要功能
+
+- 寄存器前/后对比：点击代码行，显示该事件前/后的寄存器值，变化项高亮。
+- 值流追踪：在侧边面板按寄存器或内存地址筛选变化事件，点击条目跳转；支持导出 Python 回放代码/伪代码说明。
+- 内存写入对比：展示写入前/后的字节差异，支持写入宽度切换（1/2/4 字节）。
+- 字号调节：菜单“视图 -> 代码字体增大/减小”（Ctrl+= / Ctrl+-）。
+- 地址直达：顶部导航栏输入 `0x...` 回车跳转。
+
+## 适配范围
+
+- ARM32 指令的基础语法高亮与有效地址求值（`[r0]`、`[r0, #imm]`、`[r0, r2, lsl #2]`）。
+- 针对 `str/ldr` 指令的有效地址推导，用于辅助定位内存读写来源。
+
+## 常见问题
+
+- 若界面空白或报 `_eval_effective_address` 缺失，请确认使用的外部仓库版本，并清理 `__pycache__` 后重试：
+  - `find trace_viewer -name '__pycache__' -type d -exec rm -rf {} +`
+

@@ -1,0 +1,49 @@
+---
+alwaysApply: false
+description: Unidbg trace 上下文、关键 PC、内存槽位、orig_low8 与校验代码
+---
+# Unidbg Trace 上下文（libcms.so）
+
+- 目标 40 字符串：`fbe7eb117c9a1e8259e8ed9b8c79d0156787f113`
+
+- 关键 PC/指令（ARM32）
+  - 写出：`0x12025890 strb r1, [r0]`（仅写 r1 低 8 位）
+  - 读回槽位：`0x1202588c ldr r1, [r1, #4]`
+  - 取反：`0x12026620 mvn r1, r1`
+  - 取槽：`0x12026614 ldr r1, [r0, r1, lsl #2]`
+
+- 表与地址
+  - 表基址：`0xe4fff400`（常先 `+4` 对齐至 `0xe4fff404`）
+  - 索引1槽：`0xe4fff408`（字对齐 `(index<<2)`）
+
+- 流程摘要（本批 20 字节相同）
+  1) 读索引1槽当前值（及可能与索引0做 `orr`）；
+  2) `mvn` 取反，写回索引1槽；
+  3) 输出分支读回同槽，`strb` 写低 8 位到结果缓冲。
+
+- mvn 前原值（低 8 位）orig_low8：
+```
+[0x04,0x18,0x14,0xEE,0x83,0x65,0xE1,0x7D,0xA6,0x17,
+ 0x12,0x64,0x73,0x86,0x2F,0xEA,0x98,0x78,0x0E,0xEC]
+```
+
+- Python 校验：
+```python
+from typing import List
+
+def invert_bytes(values: List[int]) -> bytes:
+    return bytes(((~v) & 0xFF) for v in values)
+
+orig_low8 = [
+    0x04, 0x18, 0x14, 0xEE, 0x83, 0x65, 0xE1, 0x7D, 0xA6, 0x17,
+    0x12, 0x64, 0x73, 0x86, 0x2F, 0xEA, 0x98, 0x78, 0x0E, 0xEC,
+]
+
+print(invert_bytes(orig_low8).hex())
+# fbe7eb117c9a1e8259e8ed9b8c79d0156787f113
+```
+
+- 追根方法（定位 orig_low8 来源）
+  - 在 trace 中：以 `0xe4fff408` 为锚点倒序找最近一次写入（`str/strh/strb/stm` 等任何寻址形态），其写入值的低 8 位即对应 orig_low8；
+  - 在 unidbg 中：优先安装 UC_HOOK_MEM_WRITE 钩子监控 `0xe4fff400..0xe4fff410`，必要时再补钩 `memcpy`；记录 PC/模块偏移、写入值与回溯栈即可快速还原算式链。
+

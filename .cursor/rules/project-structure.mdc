@@ -1,0 +1,54 @@
+---
+alwaysApply: true
+---
+# 项目结构与关键入口
+
+- 主程序入口：[trace_viewer/app.py](mdc:trace_viewer/app.py)
+  - 窗口类：`TraceViewer`
+  - 后台线程：`ParserWorker`（解析）、`RegsWorker`（寄存器复原）、`ChainWorker`（值流，定义于 [trace_viewer/value_flow.py](mdc:trace_viewer/value_flow.py)）
+  - 启动函数：`main()`
+
+- 值流追踪面板：[trace_viewer/value_flow.py](mdc:trace_viewer/value_flow.py)
+  - 组件：`ValueFlowDock`
+  - 异步链路构建：`ChainWorker`
+
+- 解析与索引：[trace_viewer/trace_parser.py](mdc:trace_viewer/trace_parser.py)
+  - 事件数据：`TraceEvent`
+  - 解析器：`TraceParser`
+  - 关键索引：`addr_index`、`reg_read_index`、`reg_write_index`、`store_addr_index`
+  - 预计算：`TraceEvent.effaddr/mem_width/mem_op`
+  - 复原缓存：`_regs_cache`（LRU）
+
+- 其它
+  - 包声明：[trace_viewer/__init__.py](mdc:trace_viewer/__init__.py)
+  - 项目配置：[pyproject.toml](mdc:pyproject.toml)
+  - 文档：[README.md](mdc:README.md)
+
+约定
+- UI 与重活分离：所有耗时操作使用后台线程，不阻塞主线程。
+- 值流点击采用轻量节流（约 80ms）。
+---
+alwaysApply: true
+---
+## 项目结构与关键入口
+
+- 根模块
+  - `unidbg/`（根目录）
+  - 子模块：`unidbg-api/`, `unidbg-android/`, `unidbg-ios/`, `backend/`（含 `dynarmic/`, `unicorn2/` 等）
+
+- Android 相关
+  - 代码：`[unidbg-android/src/main/java](mdc:unidbg-android/src/main/java)`
+  - 测试与样本：`[unidbg-android/src/test/java](mdc:unidbg-android/src/test/java)`
+  - 重要 trace 文件：`[unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt](mdc:unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt)`（超大，按需检索）
+
+- iOS 相关
+  - 代码与 native：`[unidbg-ios/src](mdc:unidbg-ios/src)`
+
+- Backend（CPU 后端 / 原生库）
+  - `backend/dynarmic/`、`backend/unicorn2/`：后端实现与对应 natives
+
+## 常用提示
+
+- 大文件（如 trace）优先使用工具检索定位片段，避免整文件加载。
+- Android 算法/trace 分析常位于 `lib*.so` 路径日志中；先定位关键 PC/指令，再回溯寄存器与表地址。
+

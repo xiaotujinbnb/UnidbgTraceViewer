@@ -1,0 +1,34 @@
+---
+alwaysApply: true
+---
+# 工程结构与工具拆分指引
+
+本仓库为 `unidbg` 主工程，包含以下关键模块与路径：
+
+- Android 相关代码与样本
+  - 代码目录：[unidbg-android/src/main/java](mdc:unidbg-android/src/main/java)
+  - 测试样本与 trace：[unidbg-android/src/test/java](mdc:unidbg-android/src/test/java)
+  - 重要样本 trace 文件：
+    - [unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt](mdc:unidbg-android/src/test/java/com/fanqie/fanqie_trace.txt)
+
+- iOS 相关
+  - 代码与 native：[unidbg-ios/src](mdc:unidbg-ios/src)
+
+- 后端（CPU/Natives）
+  - Dynarmic/Unicorn/KVM 等在 `backend/` 下
+
+## 工具拆分说明（重要）
+
+- 原先位于本仓库 `tools/trace_viewer/` 的 GUI 解析与可视化工具，已迁移到独立外部仓库 “unidbg-trace-tools”。
+- 本仓库不再维护 GUI 工具代码与其规则；后续工具的规则与文档将集中在工具仓库内管理与更新。
+
+## 推荐工作流
+
+1. 在本仓库执行/采集并生成 trace（如 fanqie_trace.txt）。
+2. 在外部工具仓库通过 GUI 打开 trace，进行值流追踪、内存写入对比、交互跳转与 Python 回放代码导出。
+
+## 快速提示
+
+- 本仓库侧仅保留算法样本、native 与后端实现；不要在本仓库查找 GUI 相关源码。
+- 需要使用可视化工具时，请到外部工具仓库运行 `python3.8 -m trace_viewer.app` 或使用安装后的 `trace-viewer` 命令。
+
