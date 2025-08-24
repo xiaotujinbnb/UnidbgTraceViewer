@@ -153,6 +153,8 @@ class TraceViewer(QtWidgets.QMainWindow):
         self._chain_req_id = 0
         # 异步寄存器复原
         self._regs_worker = None
+        # 忙碌光标计数器，避免不成对的 restore 导致一直处于忙碌形态
+        self._busy_count: int = 0
 
         # 菜单：文件->打开
         self._build_menu()
@@ -183,6 +185,9 @@ class TraceViewer(QtWidgets.QMainWindow):
                     t.wait(200)
         except Exception:
             pass
+        # 清理忙碌光标
+        while getattr(self, '_busy_count', 0) > 0:
+            self._busy(False)
         super().closeEvent(event)
 
     def _on_func_clicked(self, item: QtWidgets.QTreeWidgetItem, column: int) -> None:
@@ -460,10 +465,11 @@ class TraceViewer(QtWidgets.QMainWindow):
         # 异步执行避免阻塞 UI
         self._chain_req_id += 1
         req_id = self._chain_req_id
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self._busy(True)
         try:
             if self._chain_worker and self._chain_worker.isRunning():
                 self._chain_worker.requestInterruption()
+                self._chain_worker.wait(50)
         except Exception:
             pass
         self._chain_worker = ChainWorker(self.parser, reg, start_idx, match_val, side_sel, req_id)
@@ -474,7 +480,7 @@ class TraceViewer(QtWidgets.QMainWindow):
         # 仅处理最新请求，避免过期结果覆盖
         if req_id != getattr(self, '_chain_req_id', 0):
             return
-        QtWidgets.QApplication.restoreOverrideCursor()
+        self._busy(False)
         if not indices:
             self.statusBar().showMessage('未能构建值路径')
             return
@@ -491,13 +497,13 @@ class TraceViewer(QtWidgets.QMainWindow):
                 self._regs_worker.wait(50)
         except Exception:
             pass
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        self._busy(True)
         self._regs_worker = RegsWorker(self.parser, ev_idx, self)
         self._regs_worker.finishedWithIndex.connect(self._on_regs_ready)
         self._regs_worker.start()
 
     def _on_regs_ready(self, before: dict, after: dict, ev_idx: int) -> None:
-        QtWidgets.QApplication.restoreOverrideCursor()
+        self._busy(False)
         # 渲染寄存器；若期间用户已跳转到其它行，也仍然渲染最新计算结果
         self._render_regs(before, after)
         # 渲染完成后再刷新内存对比，避免在点击当下阻塞
@@ -860,4 +866,19 @@ if __name__ == '__main__':
 
 
 
+    # 统一管理忙碌光标，避免不成对 restore 导致卡顿光标
+def _busy_dummy():
+    pass
+
+def _busy(self, on: bool) -> None:
+    try:
+        if on:
+            self._busy_count = max(0, getattr(self, '_busy_count', 0)) + 1
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        else:
+            if getattr(self, '_busy_count', 0) > 0:
+                self._busy_count -= 1
+                QtWidgets.QApplication.restoreOverrideCursor()
+    except Exception:
+        pass
  
