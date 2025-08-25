@@ -22,6 +22,8 @@ class TraceEvent:
     raw: str                     # 原始整行文本
     writes: Dict[str, int] = field(default_factory=dict)  # 写入寄存器集合
     reads: Dict[str, int] = field(default_factory=dict)   # 读取寄存器集合
+    # 预计算：有效内存地址（仅对 ldr/str 有意义）
+    effaddr: Optional[int] = None
     # 调用标注
     call_id: int = 0               # 所属调用实例编号（0 表示顶层/未进入函数）
     call_depth: int = 0            # 当前调用栈深度（进入一次 +1，返回 -1）
@@ -35,10 +37,12 @@ class TraceParser:
     - 构建 地址→事件索引，并收集分支目标作为“函数候选”；
     - 解析每行寄存器读写，并定期保存寄存器快照以便快速复原任意时刻寄存器。"""
 
-    # 示例行格式（ARM32）：
-    # [16:58:33 051][libcms.so 0x2588c] [041091e5] 0x1202588c: "ldr r1, [r1, #4]" r1=0xe4fff404 => r1=0x1
+    # 示例行格式（ARM32/Thumb）：
+    # 32位编码: [041091e5] 0x1202588c: "ldr r1, [r1, #4]" ...
+    # 16位编码: [0978    ] 0x12023dd6: "ldrb r1, [r1]" ...
+    # 适配 4 或 8 位编码，右侧可能有空格填充
     LINE_RE = re.compile(
-        r"^\[(?P<ts>[^\]]+)\]\[(?P<mod>[^\s\]]+)\s+(?P<modoff>0x[0-9a-fA-F]+)\]\s+\[(?P<enc>[0-9a-fA-F]{8})\]\s+"
+        r"^\[(?P<ts>[^\]]+)\]\[(?P<mod>[^\s\]]+)\s+(?P<modoff>0x[0-9a-fA-F]+)\]\s+\[(?P<enc>[0-9a-fA-F]{4}(?:\s{0,4}[0-9a-fA-F]{0,4})?)\]\s+"
         r"(?P<pc>0x[0-9a-fA-F]+):\s+\"(?P<asm>[^\"]+)\"(?P<rest>.*)$"
     )
 
@@ -72,6 +76,11 @@ class TraceParser:
         # 寄存器复原 LRU 缓存
         self._regs_cache: "OrderedDict[int, Dict[str, int]]" = OrderedDict()
         self._regs_cache_cap: int = 1024
+        # 有效地址 LRU 缓存，避免重复重建寄存器
+        self._effaddr_cache: "OrderedDict[int, Optional[int]]" = OrderedDict()
+        self._effaddr_cache_cap: int = 8192
+        # store 地址索引：addr -> 已排序的事件索引列表（仅 str* 指令）
+        self.store_addr_index: Dict[int, List[int]] = {}
 
     def parse_file(self, path: str, progress_cb: Optional[callable] = None) -> None:
         """解析 trace 文件并构建索引；若存在可用 SQLite 缓存则直接加载。"""
@@ -140,6 +149,8 @@ class TraceParser:
                     self._reg_checkpoints[i] = dict(self._current_regs)
                     if cache is not None:
                         cache.commit()
+        # 解析完成后，预计算 ldr/str 的有效地址并构建 store_addr 索引
+        self._precompute_memory_effects()
         if cache is not None:
             try:
                 cache.write_signature(self._checkpoint_interval, version="v1")
@@ -228,6 +239,8 @@ class TraceParser:
             self._apply_writes(ev)
             if line_no % self._checkpoint_interval == 0:
                 self._reg_checkpoints[line_no] = dict(self._current_regs)
+        # 从缓存加载后同样补建内存相关预计算
+        self._precompute_memory_effects()
     
     def _annotate_call(self, ev: TraceEvent) -> None:
         """为事件打上调用实例编号与深度。
@@ -533,6 +546,130 @@ class TraceParser:
         chain = sorted(set(chain))
         return chain
 
+    def _parse_store_value_reg(self, asm: str) -> Optional[str]:
+        """从 store 指令里解析被写入内存的“源寄存器”，例如：
+        - str r1, [r0, #4] -> r1
+        - strb r2, [r3] -> r2
+        - strh x1, [x0, x2, lsl #1] -> x1
+        """
+        s = asm.strip().lower()
+        if not s.startswith('str'):
+            return None
+        import re as _re
+        m = _re.match(r"^str\w*\s+([rxw][0-9]{1,2})\s*,\s*\[", s)
+        if not m:
+            return None
+        return m.group(1)
+
+    def _find_prev_store_to_address(self, addr: int, from_index_exclusive: int, max_steps: int = 1500, same_call_id: Optional[int] = None) -> Optional[int]:
+        # 若有地址索引，直接在列表中二分回溯
+        lst = self.store_addr_index.get(addr)
+        if lst:
+            from bisect import bisect_left
+            pos = bisect_left(lst, from_index_exclusive) - 1
+            while pos >= 0:
+                j = lst[pos]
+                if same_call_id is not None and self.events[j].call_id != same_call_id:
+                    pos -= 1
+                    continue
+                return j
+            return None
+        # 退化：顺序扫描（带步数上限）
+        steps = 0
+        for j in range(from_index_exclusive - 1, -1, -1):
+            if steps >= max_steps:
+                break
+            evj = self.events[j]
+            sj = evj.asm.lower()
+            if not sj.startswith('str'):
+                continue
+            if same_call_id is not None and evj.call_id != same_call_id:
+                continue
+            steps += 1
+            a = evj.effaddr if evj.effaddr is not None else self.effective_address(j)
+            if a == addr:
+                return j
+        return None
+
+    def build_value_chain_phase1(self, reg: str, start_idx: int, value_u32: int, side: str = '执行前') -> List[int]:
+        """第一阶段：内存感知的值链追踪。
+
+        目标：当目标寄存器的值来源于一次 ldr 加载时，向前找到写入该内存地址的最近一次 store，
+        并继续回溯该 store 的“源寄存器”的写入链，直到遇到 ldr 或包含立即数的写入为止。
+
+        若不满足上述条件，回退到 build_value_chain_fast 的结果。
+        """
+        reg = (reg or '').lower()
+        n = len(self.events)
+        if n == 0:
+            return []
+        start_idx = max(0, min(start_idx, n - 1))
+
+        # 先拿到基本链（含写入点与后续读取），用于兜底与并集
+        base_chain = set(self.build_value_chain_fast(reg, start_idx, value_u32 & 0xFFFFFFFF, side))
+
+        # 定位写入点（复用快速链路中的逻辑片段）
+        writer_idx: Optional[int] = None
+        if side == '执行后':
+            ev = self.events[start_idx]
+            if reg in ev.writes and (ev.writes.get(reg) & 0xFFFFFFFF) == (value_u32 & 0xFFFFFFFF):
+                writer_idx = start_idx
+        if writer_idx is None:
+            j = self.find_prev_write(reg, start_idx)
+            while j is not None:
+                evj = self.events[j]
+                val = evj.writes.get(reg)
+                if val is not None and (val & 0xFFFFFFFF) == (value_u32 & 0xFFFFFFFF):
+                    writer_idx = j
+                    break
+                j = self.find_prev_write(reg, j)
+        if writer_idx is None:
+            writer_idx = start_idx
+
+        writer_ev = self.events[writer_idx]
+        s = writer_ev.asm.lower()
+        # 仅在 ldr 写入该寄存器时尝试跨内存回溯
+        if not (s.startswith('ldr') and reg in writer_ev.writes):
+            return sorted(base_chain) if base_chain else [writer_idx]
+
+        addr = self.effective_address(writer_idx)
+        if addr is None:
+            return sorted(base_chain) if base_chain else [writer_idx]
+
+        # 先在同一调用内查找最近 store，未命中再放宽到全局并扩大步数
+        store_idx = self._find_prev_store_to_address(addr, writer_idx, same_call_id=self.events[writer_idx].call_id)
+        if store_idx is None:
+            store_idx = self._find_prev_store_to_address(addr, writer_idx, max_steps=4000, same_call_id=None)
+        if store_idx is None:
+            return sorted(base_chain) if base_chain else [writer_idx]
+
+        store_ev = self.events[store_idx]
+        src_reg = self._parse_store_value_reg(store_ev.asm)
+        if not src_reg:
+            return sorted(base_chain) if base_chain else [writer_idx]
+
+        # 从 store 之前回溯源寄存器的写入序列，直到 ldr 或立即数写入
+        back_chain: List[int] = []
+        guard = 0
+        j = self.find_prev_write(src_reg, store_idx)
+        while j is not None and guard < 6000:
+            guard += 1
+            evj = self.events[j]
+            back_chain.append(j)
+            sj = evj.asm.lower()
+            if sj.startswith('ldr '):
+                break
+            if self._is_immediate_write(evj, src_reg):
+                break
+            j = self.find_prev_write(src_reg, j)
+
+        chain = set(back_chain)
+        chain.add(store_idx)
+        chain.add(writer_idx)
+        # 合并基础链（含向后读取等）
+        chain.update(base_chain)
+        return sorted(chain)
+
     def value_chain_from_event(self, reg: str, event_index: int, side: str = '执行前') -> List[int]:
         ev = self.events[event_index]
         b = ev.reads.get(reg)
@@ -592,10 +729,19 @@ class TraceParser:
     def effective_address(self, event_index: int) -> Optional[int]:
         if event_index < 0 or event_index >= len(self.events):
             return None
+        # LRU 缓存
+        cached = self._effaddr_cache.get(event_index)
+        if cached is not None:
+            self._effaddr_cache.move_to_end(event_index)
+            return cached
         ev = self.events[event_index]
         asm = ev.asm.lower()
         if not (asm.startswith('str') or asm.startswith('ldr')):
             return None
+        # 若已预计算，直接返回并写入 LRU
+        if ev.effaddr is not None:
+            self._effaddr_cache[event_index] = ev.effaddr
+            return ev.effaddr
         lb = asm.find('[')
         rb = asm.find(']', lb + 1)
         if lb < 0 or rb < 0:
@@ -622,7 +768,14 @@ class TraceParser:
                 off = int(imm, 0)
             except Exception:
                 return None
-            return (b + off) & 0xFFFFFFFF
+            res = (b + off) & 0xFFFFFFFF
+            self._effaddr_cache[event_index] = res
+            if len(self._effaddr_cache) > self._effaddr_cache_cap:
+                try:
+                    self._effaddr_cache.popitem(last=False)
+                except Exception:
+                    self._effaddr_cache.clear()
+            return res
         # [r0, r2, lsl #2] / [x0, x2, lsl #2] / [x0, w2, lsl #2]
         if (', r' in expr or ', x' in expr or ', w' in expr) and 'lsl' in expr:
             parts = expr.split(',')
@@ -639,8 +792,43 @@ class TraceParser:
                 sh = int(lsl_part.split('#')[-1], 0)
             except Exception:
                 return None
-            return (b + (i << sh)) & 0xFFFFFFFF
+            res = (b + (i << sh)) & 0xFFFFFFFF
+            self._effaddr_cache[event_index] = res
+            if len(self._effaddr_cache) > self._effaddr_cache_cap:
+                try:
+                    self._effaddr_cache.popitem(last=False)
+                except Exception:
+                    self._effaddr_cache.clear()
+            return res
+        # 未命中可解析形式
+        self._effaddr_cache[event_index] = None
+        if len(self._effaddr_cache) > self._effaddr_cache_cap:
+            try:
+                self._effaddr_cache.popitem(last=False)
+            except Exception:
+                self._effaddr_cache.clear()
         return None
+
+    def _precompute_memory_effects(self) -> None:
+        """为所有 ldr/str 事件预计算有效地址，并为 str 事件建立地址倒排索引。"""
+        try:
+            self.store_addr_index.clear()
+            for idx, ev in enumerate(self.events):
+                s = ev.asm.lower()
+                if not (s.startswith('ldr') or s.startswith('str')):
+                    continue
+                # 计算并缓存有效地址
+                addr = self.effective_address(idx)
+                ev.effaddr = addr
+                # 仅索引 store
+                if addr is not None and s.startswith('str'):
+                    self.store_addr_index.setdefault(addr, []).append(idx)
+            # 保证每个地址下的列表有序
+            for addr, lst in self.store_addr_index.items():
+                lst.sort()
+        except Exception:
+            # 预计算失败不影响基础功能
+            pass
 
     def find_events_near(self, event_index: int, window: int = 300) -> Tuple[int, List[TraceEvent]]:
         """获取某事件索引附近的一段事件窗口（用于代码视图展示）。"""

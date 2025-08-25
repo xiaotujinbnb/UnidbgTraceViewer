@@ -2,6 +2,7 @@ import sys
 import re
 import os
 import shutil
+import signal
 from typing import Optional
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -42,9 +43,31 @@ class ClickableCodeEdit(QtWidgets.QPlainTextEdit):
         # 暗色主题下的局部调色将由全局样式设置，此处保持默认
         # 文档边距，避免文本贴边
         self.document().setDocumentMargin(12)
+        # 记录按下位置，用于区分点击与拖拽选择
+        self._press_pos = None
+
+    def mousePressEvent(self, e: QtGui.QMouseEvent) -> None:
+        if e.button() == QtCore.Qt.LeftButton:
+            self._press_pos = e.pos()
+        else:
+            self._press_pos = None
+        super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e: QtGui.QMouseEvent) -> None:
         super().mouseReleaseEvent(e)
+        # 仅在左键点击、无拖拽、且当前没有文本选择时，才触发行点击与地址解析，避免复制被打断
+        if e.button() != QtCore.Qt.LeftButton:
+            return
+        tc = self.textCursor()
+        if tc.hasSelection():
+            return
+        try:
+            if self._press_pos is not None:
+                moved = (self._press_pos - e.pos()).manhattanLength()
+                if moved >= QtWidgets.QApplication.startDragDistance():
+                    return
+        except Exception:
+            return
         cursor = self.cursorForPosition(e.pos())
         cursor.select(QtGui.QTextCursor.LineUnderCursor)
         line_text = cursor.selectedText()
@@ -352,14 +375,32 @@ class TraceViewer(QtWidgets.QMainWindow):
         if not self.parser:
             return
         self._tracked_reg = (reg or '').lower()
-        side = '执行前' if before else '执行后'
-        chain = self.parser.value_chain_from_event(reg, ev_idx, side)
-        if not chain:
-            self.statusBar().showMessage('未能构建值路径')
+        side_sel = '执行前' if before else '执行后'
+        # 从当前事件读取用于追踪的值
+        ev = self.parser.events[ev_idx]
+        val = (ev.reads.get(reg) if before else ev.writes.get(reg))
+        if val is None:
+            # 回退老逻辑（无需值时的近似链路）
+            chain = self.parser.value_chain_from_event(reg, ev_idx, side_sel)
+            if not chain:
+                self.statusBar().showMessage('未能构建值路径')
+                return
+            self._render_chain_list(reg, chain)
+            self._jump_to_event_index(chain[0])
             return
-        self._render_chain_list(reg, chain)
-        # 跳转到首个事件并同步
-        self._jump_to_event_index(chain[0])
+        # 异步 Phase1 构链，避免卡顿
+        try:
+            if self._chain_worker and self._chain_worker.isRunning():
+                self._chain_worker.requestInterruption()
+                self._chain_worker.wait(50)
+        except Exception:
+            pass
+        self._chain_req_id += 1
+        req_id = self._chain_req_id
+        _busy(self, True)
+        self._chain_worker = ChainWorker(self.parser, reg, ev_idx, int(val) & 0xFFFFFFFF, side_sel, req_id)
+        self._chain_worker.finishedWithId.connect(self._on_chain_ready)
+        self._chain_worker.start()
 
     def _trace_with_value_dialog(self, reg: str, side: Optional[str] = None, anchor_idx: Optional[int] = None) -> None:
         if not self.parser:
@@ -401,7 +442,7 @@ class TraceViewer(QtWidgets.QMainWindow):
                 is_match_here = (reg in ev_anchor.reads and (ev_anchor.reads.get(reg) & 0xFFFFFFFF) == match_val)
             if is_match_here:
                 # 直接以当前行为起点展示链路
-                chain = self.parser.build_value_chain_fast(reg, anchor_idx, match_val, side or '执行前')
+                chain = self.parser.build_value_chain_phase1(reg, anchor_idx, match_val, side or '执行前')
                 if chain:
                     self._render_chain_list(reg, chain)
                     self._jump_to_event_index(chain[0])
@@ -410,7 +451,7 @@ class TraceViewer(QtWidgets.QMainWindow):
             same_asm = [idx for idx in cands if self.parser.events[idx].asm == anchor_asm]
             if len(same_asm) == 1:
                 start_idx = same_asm[0]
-                chain = self.parser.build_value_chain_fast(reg, start_idx, match_val, side or '执行前')
+                chain = self.parser.build_value_chain_phase1(reg, start_idx, match_val, side or '执行前')
                 if chain:
                     self._render_chain_list(reg, chain)
                     self._jump_to_event_index(chain[0])
@@ -669,6 +710,12 @@ class TraceViewer(QtWidgets.QMainWindow):
         f = self.code_edit.font()
         f.setPointSize(fs)
         self.code_edit.setFont(f)
+        # 同步调整值流追踪面板字体
+        try:
+            if hasattr(self, 'vf_dock') and self.vf_dock is not None:
+                self.vf_dock.set_font_point_size(fs)
+        except Exception:
+            pass
 
     def load_trace(self, path: str) -> None:
         """异步加载并解析指定 trace 文件，避免卡顿，完成后刷新界面。"""
@@ -842,6 +889,17 @@ def main() -> int:
     # 支持无参启动（菜单/对话框打开文件）或命令行传入路径
     QtWidgets.QApplication.setStyle('Fusion')
     app = QtWidgets.QApplication(sys.argv)
+
+    # 让 Ctrl+C 能够可靠退出（macOS/PyQt 常见问题）：安装 SIGINT 处理并用定时器驱动事件泵
+    try:
+        signal.signal(signal.SIGINT, lambda *_: QtWidgets.QApplication.quit())
+        _sigint_timer = QtCore.QTimer()
+        _sigint_timer.timeout.connect(lambda: None)
+        _sigint_timer.start(150)
+        # 防止被 GC
+        app._sigint_timer = _sigint_timer  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
     # 启动前清理 pycache，避免旧字节码干扰
     try:

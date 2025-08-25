@@ -78,6 +78,27 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self._chain_cache: "OrderedDict[str, List[int]]" = OrderedDict()
         self._chain_cache_cap = 32
 
+    def set_font_point_size(self, point_size: int) -> None:
+        """统一调整面板内主要控件的字体大小，用于与代码区同步缩放。"""
+        try:
+            # 列表与表头
+            f = self.list.font()
+            f.setPointSize(point_size)
+            self.list.setFont(f)
+            try:
+                hf = self.list.header().font()
+                hf.setPointSize(point_size)
+                self.list.header().setFont(hf)
+            except Exception:
+                pass
+            # 表单/按钮
+            for w in [self.input_edit, self.value_edit, self.side_combo, self.btn_search, self.btn_export_python]:
+                wf = w.font()
+                wf.setPointSize(point_size)
+                w.setFont(wf)
+        except Exception:
+            pass
+
     def attach(self, parser, eval_effaddr_cb) -> None:
         self.parser = parser
         # 内存对比已禁用，这里保留接口但不使用 eval_effaddr_cb
@@ -615,13 +636,13 @@ class ChainWorker(QtCore.QThread):
         self._deadline_ms = 300  # 构链时间预算，超时提前返回
 
     def run(self) -> None:
-        # 带时间预算的构链：分阶段推进，超时返回阶段结果
+        # 带时间预算的构链：优先使用“第一阶段（内存感知）”，超时返回阶段结果
         import time as _t
         t0 = _t.perf_counter()
         indices: list[int] = []
         try:
-            # 1) 找 writer 与最近读取
-            prelim = self._parser.build_value_chain_fast(self._reg, self._start_idx, self._match_val, self._side)
+            # 1) 内存感知的第一阶段追踪
+            prelim = self._parser.build_value_chain_phase1(self._reg, self._start_idx, self._match_val, self._side)
             indices.extend(prelim[:128])  # 初步限制规模
             if (_t.perf_counter() - t0) * 1000 >= self._deadline_ms:
                 if not self.isInterruptionRequested():
