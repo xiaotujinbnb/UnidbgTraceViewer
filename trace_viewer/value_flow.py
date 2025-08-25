@@ -64,12 +64,15 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.input_edit.textChanged.connect(self._update_trace_btn_state)
         self.value_edit.textChanged.connect(self._update_trace_btn_state)
 
-        # 导出按钮（改为导出伪C代码）
+        # 导出按钮：伪C / Python
         btns = QtWidgets.QHBoxLayout()
         self.btn_export_python = QtWidgets.QPushButton('导出伪C代码')
         self.btn_export_python.clicked.connect(self._on_export_c)
+        self.btn_export_py = QtWidgets.QPushButton('导出Python代码')
+        self.btn_export_py.clicked.connect(self._on_export_py)
         btns.addStretch(1)
         btns.addWidget(self.btn_export_python)
+        btns.addWidget(self.btn_export_py)
         layout.addLayout(btns)
 
         # 异步链路计算与结果缓存
@@ -512,6 +515,202 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         lay.addLayout(btns)
         dlg.resize(760, 560)
         dlg.exec_()
+
+    def _on_export_py(self) -> None:
+        if not self.parser:
+            return
+        sel = self.list.selectedItems()
+        indices = [it.data(0, QtCore.Qt.UserRole) for it in sel if isinstance(it.data(0, QtCore.Qt.UserRole), int)]
+        if not indices:
+            QtWidgets.QMessageBox.information(self, '提示', '请在结果列表中选择若干行再导出')
+            return
+        indices.sort()
+        # 收集寄存器
+        used_regs = set()
+        for idx in indices:
+            ev = self.parser.events[idx]
+            used_regs.update(ev.reads.keys())
+            used_regs.update(ev.writes.keys())
+        reg_list = sorted(used_regs, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 99))
+
+        lines = [
+            '# 生成自 trace 值流选择（Python 伪代码）',
+            '',
+            'MASK32 = 0xFFFFFFFF',
+            'def u32(x): return x & MASK32',
+            'def brev32(x):',
+            '    x = ((x >> 1) & 0x55555555) | ((x & 0x55555555) << 1)',
+            '    x = ((x >> 2) & 0x33333333) | ((x & 0x33333333) << 2)',
+            '    x = ((x >> 4) & 0x0f0f0f0f) | ((x & 0x0f0f0f0f) << 4)',
+            '    x = ((x >> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8)',
+            '    return u32((x >> 16) | (x << 16))',
+            'def ror32(x, s): s &= 31; return u32((x >> s) | ((x << ((32 - s) & 31))))',
+            'def rev32(x): return ((x & 0xFF) << 24) | (x & 0xFF00) << 8 | (x >> 8) & 0xFF00 | (x >> 24) & 0xFF',
+            'def rev16(x): return (((x << 8) & 0xFF00FF00) | ((x >> 8) & 0x00FF00FF))',
+            'def revsh(x): import struct; return struct.unpack("<i", struct.pack("<h", (x & 0xFFFF) << 0))[0]',
+            'def clz32(x):
+    return 32 - int(x & MASK32).bit_length() if x & MASK32 else 32',
+            '',
+        ]
+        if reg_list:
+            decls = '='.join([*reg_list, '0'])
+            # 形如: r0=r1=r2=...=0
+            lines.append(decls)
+            lines.append('')
+        lines.append('def replay():')
+        for idx in indices:
+            ev = self.parser.events[idx]
+            stmt = self._bitop_py_stmt(ev.asm)
+            if stmt:
+                lines.append(f'    {stmt}  # {ev.asm}')
+            else:
+                lines.append(f'    # {ev.asm}')
+        code = '\n'.join(lines)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle('导出 Python 伪代码')
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlainText(code)
+        edit.setReadOnly(False)
+        lay.addWidget(edit)
+        btns = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton('复制到剪贴板')
+        btn_save = QtWidgets.QPushButton('保存为 .py 文件')
+        btn_copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(edit.toPlainText()), QtWidgets.QMessageBox.information(dlg, '已复制', '代码已复制')))
+        def _save():
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, '保存为 .py', 'replay.py', 'Python Files (*.py);;All Files (*)')
+            if path:
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(edit.toPlainText())
+                    QtWidgets.QMessageBox.information(dlg, '已保存', f'已保存到\n{path}')
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(dlg, '保存失败', str(e))
+        btn_save.clicked.connect(_save)
+        btns.addStretch(1)
+        btns.addWidget(btn_copy)
+        btns.addWidget(btn_save)
+        lay.addLayout(btns)
+        dlg.resize(760, 560)
+        dlg.exec_()
+
+    def _bitop_py_stmt(self, asm: str) -> str:
+        s = asm.strip(); low = s.lower()
+        import re as _re
+        m = _re.match(r"^(\w+)\s+(\w+)\s*,\s*([^,]+)(?:\s*,\s*(.+))?$", low)
+        if not m:
+            if low.startswith('mov '):
+                try:
+                    rest = ' '.join(low.split()[1:])
+                    rd, rn = [x.strip() for x in rest.split(',', 1)]
+                    rn = rn.replace('#', '')
+                    return f"{rd} = u32({rn})"
+                except Exception:
+                    return ''
+            if low.startswith('mvn '):
+                try:
+                    rest = ' '.join(low.split()[1:])
+                    rd, rn = [x.strip() for x in rest.split(',', 1)]
+                    rn = rn.replace('#', '')
+                    return f"{rd} = u32(~{rn})"
+                except Exception:
+                    return ''
+            return ''
+        op, rd, rn, rm = m.group(1), m.group(2), m.group(3), m.group(4)
+        rm = '' if rm is None else rm
+        rd = rd.strip(); rn = rn.strip()
+        # 内联第三参移位
+        def _sh(opname, txt):
+            parts = txt.split(opname)
+            base = parts[0].strip(' ,')
+            sh = parts[1].strip().replace('#','').strip()
+            if opname == 'asr':
+                return f"((({base}) & 0x80000000) and u32(({base}) >> {sh}) or u32(({base}) >> {sh}))"
+            return f"(({base}) { '<<' if opname=='lsl' else '>>' } {sh})"
+        if 'lsl' in rm:
+            rm = _sh('lsl', rm)
+        elif 'lsr' in rm:
+            rm = _sh('lsr', rm)
+        elif 'asr' in rm:
+            rm = _sh('asr', rm)
+        rm_clean = rm.replace('#','').strip() if rm else ''
+
+        # 特殊/单目
+        if op == 'rbit':
+            return f"{rd} = brev32({rn})"
+        if op == 'clz':
+            return f"{rd} = clz32({rn})"
+        if op == 'rev':
+            return f"{rd} = rev32({rn})"
+        if op == 'rev16':
+            return f"{rd} = rev16({rn})"
+        if op == 'revsh':
+            return f"{rd} = revsh({rn})"
+
+        # 位域
+        if op == 'ubfx':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = u32(({rn} >> {lsb}) & ((1 << {width}) - 1))"
+            except Exception:
+                return ''
+        if op == 'sbfx':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = u32((((({rn}) << (32 - ({lsb} + {width}))) & MASK32) >> (32 - {width})))"
+            except Exception:
+                return ''
+        if op == 'bfc':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = u32({rd} & ~(((1 << {width}) - 1) << {lsb}))"
+            except Exception:
+                return ''
+        if op == 'bfi':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = u32(({rd} & ~(((1 << {width}) - 1) << {lsb})) | ((({rn}) << {lsb}) & (((1 << {width}) - 1) << {lsb})))"
+            except Exception:
+                return ''
+
+        # 扩展
+        if op == 'uxtb':
+            return f"{rd} = u32({rn} & 0xFF)"
+        if op == 'uxth':
+            return f"{rd} = u32({rn} & 0xFFFF)"
+        if op == 'sxtb':
+            return f"{rd} = u32((({rn}) & 0xFF) if (({rn}) & 0x80)==0 else (0xFFFFFFFF - ((~({rn})+1) & 0xFF)))"
+        if op == 'sxth':
+            return f"{rd} = u32((({rn}) & 0xFFFF) if (({rn}) & 0x8000)==0 else (0xFFFFFFFF - ((~({rn})+1) & 0xFFFF)))"
+        if op == 'sxtah':
+            return f"{rd} = u32({rn} + (({rm_clean}) & 0xFFFF if (({rm_clean}) & 0x8000)==0 else (0xFFFFFFFF - ((~({rm_clean})+1) & 0xFFFF))))"
+
+        # 基本运算
+        if op == 'mvn':
+            return f"{rd} = u32(~{rn})"
+        if op == 'eor':
+            return f"{rd} = u32({rn} ^ {rm_clean})"
+        if op in ('orr', 'or'):
+            return f"{rd} = u32({rn} | {rm_clean})"
+        if op == 'and':
+            return f"{rd} = u32({rn} & {rm_clean})"
+        if op == 'add':
+            return f"{rd} = u32({rn} + {rm_clean})"
+        if op == 'sub':
+            return f"{rd} = u32({rn} - {rm_clean})"
+        if op == 'mov':
+            return f"{rd} = u32({rn})"
+
+        # 纯移位/旋转
+        if op in ('lsl','lsls'):
+            return f"{rd} = u32({rn} << {rm_clean})"
+        if op in ('lsr','lsrs'):
+            return f"{rd} = u32({rn} >> {rm_clean})"
+        if op in ('asr','asrs'):
+            return f"{rd} = u32((({rn} & 0x80000000) and ({rn} >> {rm_clean})) or ({rn} >> {rm_clean}))"
+        if op in ('ror','rors'):
+            return f"{rd} = ror32({rn}, {rm_clean})"
+        return ''
 
     def _bitop_pseudocode(self, asm: str) -> str:
         """将常见位运算指令转为简要伪代码（尽量提取 rd/rn/rm 与移位）。"""
