@@ -553,8 +553,7 @@ class TraceViewer(QtWidgets.QMainWindow):
         if end_idx < start_idx:
             start_idx, end_idx = end_idx, start_idx
         indices = list(range(start_idx, end_idx + 1))
-        # 生成伪C：重用值流面板的表达式转换
-        from .value_flow import ValueFlowDock  # type: ignore
+        # 生成伪C：重用值流面板的表达式转换（使用顶部已导入的 ValueFlowDock）
         vf = getattr(self, '_vf_helper_for_export', None)
         if vf is None:
             vf = ValueFlowDock(self)
