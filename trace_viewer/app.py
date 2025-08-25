@@ -368,6 +368,10 @@ class TraceViewer(QtWidgets.QMainWindow):
         menu.addSeparator()
         if regs:
             menu.addMenu(sub)
+        # 新增：导出选中代码为伪C
+        act_export_c = QtWidgets.QAction('导出所选代码为伪C', menu)
+        act_export_c.triggered.connect(self._export_selected_code_to_c)
+        menu.addAction(act_export_c)
         menu.exec_(self.code_edit.mapToGlobal(pos))
 
     def _trace_from_event(self, reg: str, ev_idx: int, before: bool) -> None:
@@ -527,6 +531,86 @@ class TraceViewer(QtWidgets.QMainWindow):
             return
         self._render_chain_list(reg, indices)
         self._jump_to_event_index(indices[0])
+
+    def _export_selected_code_to_c(self) -> None:
+        if not self.parser or not hasattr(self, '_current_code_start'):
+            return
+        tc = self.code_edit.textCursor()
+        # 若无选择，则默认导出当前行
+        if not tc.hasSelection():
+            start_row = end_row = getattr(self, '_current_code_row', 0)
+        else:
+            start_row = min(tc.selectionStart(), tc.selectionEnd())
+            end_row = max(tc.selectionStart(), tc.selectionEnd())
+            # 将文档位置转换为行号
+            doc = self.code_edit.document()
+            start_row = doc.findBlock(start_row).blockNumber()
+            end_row = doc.findBlock(end_row).blockNumber()
+        start_idx = self._current_code_start + max(0, start_row)
+        end_idx = self._current_code_start + max(0, end_row)
+        start_idx = max(0, min(start_idx, len(self.parser.events) - 1))
+        end_idx = max(0, min(end_idx, len(self.parser.events) - 1))
+        if end_idx < start_idx:
+            start_idx, end_idx = end_idx, start_idx
+        indices = list(range(start_idx, end_idx + 1))
+        # 生成伪C：重用值流面板的表达式转换
+        from .value_flow import ValueFlowDock  # type: ignore
+        vf = getattr(self, '_vf_helper_for_export', None)
+        if vf is None:
+            vf = ValueFlowDock(self)
+            vf.attach(self.parser, lambda idx: self.parser.effective_address(idx))
+            self._vf_helper_for_export = vf
+        used_regs = set()
+        for idx in indices:
+            ev = self.parser.events[idx]
+            used_regs.update(ev.reads.keys())
+            used_regs.update(ev.writes.keys())
+        reg_list = sorted(used_regs, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 99))
+        lines = [
+            '/* 从代码区导出（伪C） */',
+            '#include <stdint.h>',
+            '',
+        ]
+        if reg_list:
+            decls = ', '.join(f'uint32_t {r}=0' for r in reg_list)
+            lines.append(f'{decls};')
+            lines.append('')
+        lines.append('void replay(void) {')
+        for idx in indices:
+            ev = self.parser.events[idx]
+            expr = vf._bitop_c_expr(ev.asm)
+            if expr:
+                lines.append(f'    {expr}  // {ev.asm}')
+            else:
+                lines.append(f'    // {ev.asm}')
+        lines.append('}')
+        code = '\n'.join(lines)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle('导出伪C代码（代码区）')
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlainText(code)
+        lay.addWidget(edit)
+        btns = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton('复制到剪贴板')
+        btn_save = QtWidgets.QPushButton('保存为 .c 文件')
+        btn_copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(edit.toPlainText()), QtWidgets.QMessageBox.information(dlg, '已复制', '代码已复制')))
+        def _save():
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, '保存为 .c', 'replay.c', 'C Files (*.c);;All Files (*)')
+            if path:
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(edit.toPlainText())
+                    QtWidgets.QMessageBox.information(dlg, '已保存', f'已保存到\n{path}')
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(dlg, '保存失败', str(e))
+        btn_save.clicked.connect(_save)
+        btns.addStretch(1)
+        btns.addWidget(btn_copy)
+        btns.addWidget(btn_save)
+        lay.addLayout(btns)
+        dlg.resize(760, 560)
+        dlg.exec_()
 
     # =========== 异步寄存器复原，避免 UI 卡顿 ==========
     def _rebuild_regs_async(self, ev_idx: int) -> None:
