@@ -560,15 +560,16 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         return ''
 
     def _bitop_c_expr(self, asm: str) -> str:
-        """将常见位运算指令转为简要的 C 表达式语句（末尾带分号）。
-        仅覆盖 and/eor/orr/mvn/add/sub/mov 及 lsl/lsr 形式。
+        """将常见 ARM32/ARM64/Thumb 位运算与简单算术转为 C 表达式（末尾分号）。
+        覆盖：and/or/eor/mov/mvn/add/sub/lsl/lsr/lsrs/asr/ror/ubfx/sbfx/bfc/bfi/rbit/clz/rev/rev16/revsh/
+        uxtb/uxth/sxtb/sxth/sxtah 等常见形式。未覆盖的返回注释行。
         """
         s = asm.strip()
         low = s.lower()
         import re as _re
         m = _re.match(r"^(\w+)\s+(\w+)\s*,\s*([^,]+)(?:\s*,\s*(.+))?$", low)
         if not m:
-            # 简单两参形式：如 mov rd, rn
+            # 两参形式：mov/mvn/单目
             if low.startswith('mov '):
                 try:
                     parts = low.split()
@@ -587,11 +588,15 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                     return f"{rd} = ~{rn};"
                 except Exception:
                     return ''
+            # rbit/clz/rev* 两参也可能以此分支进入
             return ''
         op, rd, rn, rm = m.group(1), m.group(2), m.group(3), m.group(4)
         rm = '' if rm is None else rm
-        # 处理移位（仅 lsl/lsr）
-        sh = ''
+        opb = op.rstrip('s')  # 兼容 lsrs/asrs 等
+        rd = rd.strip()
+        rn = rn.strip()
+
+        # 若第三参自带移位（如 ip, lsr #20），先内联为 C 表达式
         if 'lsl' in rm:
             parts = rm.split('lsl')
             base = parts[0].strip(' ,')
@@ -602,23 +607,91 @@ class ValueFlowDock(QtWidgets.QDockWidget):
             base = parts[0].strip(' ,')
             sh = parts[1].strip()
             rm = f"({base} >> {sh.replace('#','').strip()})"
-        rn = rn.strip()
-        rm = rm.strip().replace('#', '')
-        # 运算映射
+        elif 'asr' in rm:
+            parts = rm.split('asr')
+            base = parts[0].strip(' ,')
+            sh = parts[1].strip()
+            rm = f"((int32_t){base} >> {sh.replace('#','').strip()})"
+        rm_clean = rm.strip().replace('#', '')
+
+        # 单目/特殊
+        if op == 'rbit':
+            return f"{rd} = __builtin_bitreverse32({rn});"
+        if op == 'clz':
+            return f"{rd} = __builtin_clz({rn});"
+        if op == 'rev':
+            return f"{rd} = __builtin_bswap32({rn});"
+        if op == 'rev16':
+            return f"{rd} = ((({rn} << 8) & 0xFF00FF00u) | (({rn} >> 8) & 0x00FF00FFu));"
+        if op == 'revsh':
+            return f"{rd} = (int32_t)(int16_t)__builtin_bswap16((uint16_t){rn});"
+
+        # 位域
+        if op == 'ubfx':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = (({rn} >> {lsb}) & ((1u << {width}) - 1));"
+            except Exception:
+                return ''
+        if op == 'sbfx':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} = ((int32_t)({rn} << (32 - ({lsb} + {width}))) >> (32 - {width}));"
+            except Exception:
+                return ''
+        if op == 'bfc':
+            try:
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{rd} &= ~(((1u << {width}) - 1) << {lsb});"
+            except Exception:
+                return ''
+        if op == 'bfi':
+            try:
+                # 语法：bfi rd, rn, #lsb, #width
+                lsb, width = [x.strip().lstrip('#') for x in rm.split(',')]
+                return f"{{ uint32_t __mask = ((1u << {width}) - 1) << {lsb}; {rd} = ({rd} & ~__mask) | ((({rn}) << {lsb}) & __mask); }}"
+            except Exception:
+                return ''
+
+        # 扩展/带加
+        if op == 'uxtb':
+            return f"{rd} = (uint32_t)(({rn}) & 0xFF);"
+        if op == 'uxth':
+            return f"{rd} = (uint32_t)(({rn}) & 0xFFFF);"
+        if op == 'sxtb':
+            return f"{rd} = (int32_t)(int8_t)({rn} & 0xFF);"
+        if op == 'sxth':
+            return f"{rd} = (int32_t)(int16_t)({rn} & 0xFFFF);"
+        if op == 'sxtah':
+            # rd = rn + SignExtend16(rm)
+            return f"{rd} = {rn} + (int32_t)(int16_t)({rm_clean} & 0xFFFF);"
+
+        # 基本运算
         if op == 'mvn':
             return f"{rd} = ~{rn};"
         if op == 'eor':
-            return f"{rd} = {rn} ^ {rm};"
-        if op == 'orr':
-            return f"{rd} = {rn} | {rm};"
+            return f"{rd} = {rn} ^ {rm_clean};"
+        if op in ('orr', 'or'):  # 兼容解析
+            return f"{rd} = {rn} | {rm_clean};"
         if op == 'and':
-            return f"{rd} = {rn} & {rm};"
+            return f"{rd} = {rn} & {rm_clean};"
         if op == 'add':
-            return f"{rd} = {rn} + {rm};"
+            return f"{rd} = {rn} + {rm_clean};"
         if op == 'sub':
-            return f"{rd} = {rn} - {rm};"
+            return f"{rd} = {rn} - {rm_clean};"
         if op == 'mov':
             return f"{rd} = {rn};"
+
+        # 纯移位类（rd, rn, sh）
+        if opb == 'lsl':
+            return f"{rd} = {rn} << {rm_clean};"
+        if opb == 'lsr':
+            return f"{rd} = {rn} >> {rm_clean};"
+        if opb == 'asr':
+            return f"{rd} = ((int32_t){rn}) >> {rm_clean};"
+        if opb == 'ror':
+            return f"{rd} = ({rn} >> ({rm_clean} & 31)) | ({rn} << ((32 - ({rm_clean} & 31)) & 31));"
+
         return ''
 
 
