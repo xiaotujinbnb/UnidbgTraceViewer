@@ -51,7 +51,26 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         # 避免快速重复点击造成阻塞：节流
         self._last_jump_ts = 0.0
 
+        # 右键菜单：复制/导出伪代码
+        self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._on_list_context)
+
         layout.addLayout(form)
+        # 污点分析区域
+        taint_form = QtWidgets.QHBoxLayout()
+        self.taint_regs_edit = QtWidgets.QLineEdit()
+        self.taint_regs_edit.setPlaceholderText('污点寄存器(逗号分隔，如 r0,r1)')
+        self.taint_mem_edit = QtWidgets.QLineEdit()
+        self.taint_mem_edit.setPlaceholderText('污点内存(十六进制，逗号分隔，如 0x123,0x456)')
+        self.taint_samecall_chk = QtWidgets.QCheckBox('同调用内')
+        self.taint_samecall_chk.setChecked(True)
+        self.btn_taint = QtWidgets.QPushButton('污点前向分析')
+        self.btn_taint.clicked.connect(self._on_taint_run)
+        taint_form.addWidget(self.taint_regs_edit)
+        taint_form.addWidget(self.taint_mem_edit)
+        taint_form.addWidget(self.taint_samecall_chk)
+        taint_form.addWidget(self.btn_taint)
+        layout.addLayout(taint_form)
         layout.addWidget(self.list)
         self.setWidget(container)
 
@@ -409,6 +428,257 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         else:
             QtWidgets.QApplication.restoreOverrideCursor()
 
+    # === 列表右键菜单 ===
+    def _on_list_context(self, pos: QtCore.QPoint) -> None:
+        sel = self.list.selectedItems()
+        menu = QtWidgets.QMenu(self)
+        act_copy = menu.addAction('复制选中行')
+        act_c = menu.addAction('导出所选为伪C')
+        act_py = menu.addAction('导出所选为伪Python')
+        menu.addSeparator()
+        act_taint_here = menu.addAction('以此行为起点做污点分析')
+        if not sel:
+            act_copy.setEnabled(False)
+            act_c.setEnabled(False)
+            act_py.setEnabled(False)
+            act_taint_here.setEnabled(False)
+        act_copy.triggered.connect(self._copy_selected_rows)
+        act_c.triggered.connect(lambda: self._export_code_via_selection(mode='c'))
+        act_py.triggered.connect(lambda: self._export_code_via_selection(mode='py'))
+        act_taint_here.triggered.connect(self._on_taint_run_from_context)
+        menu.exec_(self.list.mapToGlobal(pos))
+
+    def _copy_selected_rows(self) -> None:
+        sel = self.list.selectedItems()
+        if not sel:
+            return
+        pairs = []  # (idx, item)
+        for it in sel:
+            idx = it.data(0, QtCore.Qt.UserRole)
+            if isinstance(idx, int):
+                pairs.append((idx, it))
+        pairs.sort(key=lambda x: x[0])
+        lines = []
+        for _, it in pairs:
+            cols = [it.text(c) for c in range(self.list.columnCount())]
+            lines.append('\t'.join(cols))
+        QtWidgets.QApplication.clipboard().setText('\n'.join(lines))
+        try:
+            self.parent().statusBar().showMessage('已复制到剪贴板', 1500)  # type: ignore[union-attr]
+        except Exception:
+            QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0, 0)), '已复制到剪贴板')
+
+    # === 统一导出通道，支持大选择异步生成 ===
+    def _export_code_via_selection(self, mode: str) -> None:
+        if not self.parser:
+            return
+        sel = self.list.selectedItems()
+        indices = [it.data(0, QtCore.Qt.UserRole) for it in sel if isinstance(it.data(0, QtCore.Qt.UserRole), int)]
+        if not indices:
+            QtWidgets.QMessageBox.information(self, '提示', '请在结果列表中选择若干行再导出')
+            return
+        indices = sorted(set(indices))
+        # 大体量异步生成，避免 UI 卡顿
+        if len(indices) >= 800:
+            self._set_busy(True)
+            try:
+                if hasattr(self, '_codegen_worker') and self._codegen_worker and self._codegen_worker.isRunning():
+                    self._codegen_worker.requestInterruption()
+            except Exception:
+                pass
+            self._codegen_worker = _CodeGenWorker(self, indices, mode)
+            self._codegen_worker.finishedWithCode.connect(self._on_codegen_ready)
+            self._codegen_worker.start()
+            return
+        # 小体量：同步生成
+        if mode == 'c':
+            code = self._gen_c_code(indices)
+            title, name, filt = '导出伪C代码', 'replay.c', 'C Files (*.c);;All Files (*)'
+        else:
+            code = self._gen_py_code(indices)
+            title, name, filt = '导出 Python 伪代码', 'replay.py', 'Python Files (*.py);;All Files (*)'
+        self._show_code_dialog(title, name, filt, code)
+
+    # === 污点分析 ===
+    def _on_taint_run_from_context(self) -> None:
+        sel = self.list.selectedItems()
+        if not sel:
+            return
+        it = sel[0]
+        idx = it.data(0, QtCore.Qt.UserRole)
+        if not isinstance(idx, int):
+            return
+        self._run_taint(start_idx=idx)
+
+    def _on_taint_run(self) -> None:
+        sel = self.list.selectedItems()
+        start_idx = 0
+        if sel:
+            maybe = sel[0].data(0, QtCore.Qt.UserRole)
+            if isinstance(maybe, int):
+                start_idx = maybe
+        self._run_taint(start_idx=start_idx)
+
+    def _parse_taint_inputs(self) -> tuple:
+        regs_txt = (self.taint_regs_edit.text() or '').strip()
+        mem_txt = (self.taint_mem_edit.text() or '').strip()
+        regs = [s.strip().lower() for s in regs_txt.split(',') if s.strip()]
+        addrs = []
+        if mem_txt:
+            for s in mem_txt.split(','):
+                st = s.strip().lower()
+                if not st:
+                    continue
+                try:
+                    addrs.append(int(st, 16) if st.startswith('0x') else int(st, 16))
+                except Exception:
+                    pass
+        return regs, addrs
+
+    def _run_taint(self, start_idx: int) -> None:
+        if not self.parser:
+            return
+        regs, addrs = self._parse_taint_inputs()
+        same_call = bool(self.taint_samecall_chk.isChecked())
+        self._set_busy(True)
+        try:
+            if hasattr(self, '_taint_worker') and self._taint_worker and self._taint_worker.isRunning():
+                self._taint_worker.requestInterruption()
+        except Exception:
+            pass
+        self._taint_worker = TaintWorker(self.parser, start_idx, regs, addrs, same_call)
+        self._taint_worker.finishedWithHits.connect(self._on_taint_ready)
+        self._taint_worker.start()
+
+    @QtCore.pyqtSlot(list)
+    def _on_taint_ready(self, hits: list) -> None:
+        self._set_busy(False)
+        if not hits:
+            QtWidgets.QMessageBox.information(self, '污点分析', '未命中污点相关事件')
+            return
+        self.list.setUpdatesEnabled(False)
+        try:
+            self.list.clear()
+            for idx in hits:
+                ev = self.parser.events[idx]
+                rw = 'W' if ev.writes else ('R' if ev.reads else '')
+                item = QtWidgets.QTreeWidgetItem([
+                    str(ev.line_no), f"0x{ev.pc:08x}", rw, ev.asm,
+                    '', '', str(getattr(ev, 'call_id', 0)), self._fmt_low8(None, idx), self._fmt_bitops(ev.asm)
+                ])
+                item.setData(0, QtCore.Qt.UserRole, idx)
+                self.list.addTopLevelItem(item)
+        finally:
+            self.list.setUpdatesEnabled(True)
+            self.list.viewport().update()
+
+    def _show_code_dialog(self, title: str, default_name: str, file_filter: str, code: str) -> None:
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(title)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlainText(code)
+        edit.setReadOnly(False)
+        lay.addWidget(edit)
+        btns = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton('复制到剪贴板')
+        btn_save = QtWidgets.QPushButton('保存到文件')
+        btn_copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(edit.toPlainText()), QtWidgets.QMessageBox.information(dlg, '已复制', '代码已复制')))
+        def _save():
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, f'保存为 {default_name}', default_name, file_filter)
+            if path:
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(edit.toPlainText())
+                    QtWidgets.QMessageBox.information(dlg, '已保存', f'已保存到\n{path}')
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(dlg, '保存失败', str(e))
+        btn_save.clicked.connect(_save)
+        btns.addStretch(1)
+        btns.addWidget(btn_copy)
+        btns.addWidget(btn_save)
+        lay.addLayout(btns)
+        dlg.resize(760, 560)
+        dlg.exec_()
+
+    def _gen_c_code(self, indices: list) -> str:
+        used_regs = set()
+        for idx in indices:
+            ev = self.parser.events[idx]
+            used_regs.update(ev.reads.keys())
+            used_regs.update(ev.writes.keys())
+        reg_list = sorted(used_regs, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 99))
+        lines = [
+            '/* 生成自 trace 值流选择（伪C） */',
+            '#include <stdint.h>',
+            '',
+        ]
+        if reg_list:
+            decls = ', '.join(f'uint32_t {r}=0' for r in reg_list)
+            lines.append(f'{decls};')
+            lines.append('')
+        lines.append('void replay(void) {')
+        for idx in indices:
+            ev = self.parser.events[idx]
+            expr = self._bitop_c_expr(ev.asm)
+            if expr:
+                lines.append(f'    {expr}  // {ev.asm}')
+            else:
+                lines.append(f'    // {ev.asm}')
+        lines.append('}')
+        return '\n'.join(lines)
+
+    def _gen_py_code(self, indices: list) -> str:
+        used_regs = set()
+        for idx in indices:
+            ev = self.parser.events[idx]
+            used_regs.update(ev.reads.keys())
+            used_regs.update(ev.writes.keys())
+        reg_list = sorted(used_regs, key=lambda x: (x[0], int(x[1:]) if x[1:].isdigit() else 99))
+        lines = [
+            '# 生成自 trace 值流选择（Python 伪代码）',
+            '',
+            'MASK32 = 0xFFFFFFFF',
+            'def u32(x): return x & MASK32',
+            'def brev32(x):',
+            '    x = ((x >> 1) & 0x55555555) | ((x & 0x55555555) << 1)',
+            '    x = ((x >> 2) & 0x33333333) | ((x & 0x33333333) << 2)',
+            '    x = ((x >> 4) & 0x0f0f0f0f) | ((x & 0x0f0f0f0f) << 4)',
+            '    x = ((x >> 8) & 0x00ff00ff) | ((x & 0x00ff00ff) << 8)',
+            '    return u32((x >> 16) | (x << 16))',
+            'def ror32(x, s): s &= 31; return u32((x >> s) | ((x << ((32 - s) & 31))))',
+            'def rev32(x): return ((x & 0xFF) << 24) | (x & 0xFF00) << 8 | (x >> 8) & 0xFF00 | (x >> 24) & 0xFF',
+            'def rev16(x): return (((x << 8) & 0xFF00FF00) | ((x >> 8) & 0x00FF00FF))',
+            'def revsh(x): import struct; return struct.unpack("<i", struct.pack("<h", (x & 0xFFFF) << 0))[0]',
+            'def clz32(x): return 32 - int(x & MASK32).bit_length() if x & MASK32 else 32',
+            '',
+        ]
+        if reg_list:
+            decls = '='.join([*reg_list, '0'])
+            lines.append(decls)
+            lines.append('')
+        lines.append('def replay():')
+        for idx in indices:
+            ev = self.parser.events[idx]
+            stmt = self._bitop_py_stmt(ev.asm)
+            if stmt:
+                lines.append(f'    {stmt}  # {ev.asm}')
+            else:
+                lines.append(f'    # {ev.asm}')
+        return '\n'.join(lines)
+
+    @QtCore.pyqtSlot(str, str)
+    def _on_codegen_ready(self, code: str, mode: str) -> None:
+        self._set_busy(False)
+        if not code:
+            QtWidgets.QMessageBox.warning(self, '导出失败', '生成代码失败')
+            return
+        if mode == 'c':
+            title, name, filt = '导出伪C代码', 'replay.c', 'C Files (*.c);;All Files (*)'
+        else:
+            title, name, filt = '导出 Python 伪代码', 'replay.py', 'Python Files (*.py);;All Files (*)'
+        self._show_code_dialog(title, name, filt, code)
+
     # === 辅助：低8位与位运算摘要 ===
     def _fmt_low8(self, reg: Optional[str], idx: int) -> str:
         if not self.parser:
@@ -548,8 +818,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
             'def rev32(x): return ((x & 0xFF) << 24) | (x & 0xFF00) << 8 | (x >> 8) & 0xFF00 | (x >> 24) & 0xFF',
             'def rev16(x): return (((x << 8) & 0xFF00FF00) | ((x >> 8) & 0x00FF00FF))',
             'def revsh(x): import struct; return struct.unpack("<i", struct.pack("<h", (x & 0xFFFF) << 0))[0]',
-            'def clz32(x):
-    return 32 - int(x & MASK32).bit_length() if x & MASK32 else 32',
+            'def clz32(x):return 32 - int(x & MASK32).bit_length() if x & MASK32 else 32',
             '',
         ]
         if reg_list:
@@ -933,5 +1202,45 @@ class ChainWorker(QtCore.QThread):
             return
         self.finishedWithId.emit(indices, self._reg, self._req_id)
 
+
+class _CodeGenWorker(QtCore.QThread):
+    finishedWithCode = QtCore.pyqtSignal(str, str)
+
+    def __init__(self, dock, indices: list, mode: str) -> None:
+        super().__init__(dock)
+        self._dock = dock
+        self._indices = list(indices)
+        self._mode = mode
+
+    def run(self) -> None:
+        try:
+            if self._mode == 'c':
+                code = self._dock._gen_c_code(self._indices)
+            else:
+                code = self._dock._gen_py_code(self._indices)
+        except Exception:
+            code = ''
+        if not self.isInterruptionRequested():
+            self.finishedWithCode.emit(code, self._mode)
+
+
+class TaintWorker(QtCore.QThread):
+    finishedWithHits = QtCore.pyqtSignal(list)
+
+    def __init__(self, parser, start_idx: int, regs: List[str], mem_addrs: List[int], same_call: bool) -> None:
+        super().__init__()
+        self._parser = parser
+        self._start_idx = start_idx
+        self._regs = list(regs)
+        self._mem = list(mem_addrs)
+        self._same_call = same_call
+
+    def run(self) -> None:
+        try:
+            hits = self._parser.taint_forward(self._start_idx, self._regs, self._mem, self._same_call, max_steps=200000)
+        except Exception:
+            hits = []
+        if not self.isInterruptionRequested():
+            self.finishedWithHits.emit(hits)
 
 

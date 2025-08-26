@@ -842,4 +842,101 @@ class TraceParser:
         items = sorted(self.branch_targets.items(), key=lambda x: x[0])
         return [(addr, name) for addr, name in items]
 
+    # === 污点分析（前向传播） ===
+    def taint_forward(self,
+                      start_idx: int,
+                      source_regs: Iterable[str] = (),
+                      source_mem_addrs: Iterable[int] = (),
+                      same_call_only: bool = False,
+                      max_steps: int = 120000) -> List[int]:
+        """从给定起点事件开始，按标准污点传播规则向前分析，返回涉及污点的事件索引（有序、去重）。
+
+        规则（简化动态污点）：
+        - 算术/位运算/数据搬运：若读取集中包含污点寄存器，则写入目的寄存器被标记为污点；
+        - ldr：若有效内存地址被污点标记，则目标寄存器变为污点；反之若读取寄存器存在污点且影响寻址，不清洗污点；
+        - str：若源寄存器是污点，则有效地址对应的内存被标记为污点；
+        - 立即数覆盖：若对寄存器的写入仅来自立即数（_is_immediate_write）且不依赖污点输入，则视为清洗该寄存器的污点；
+        - 命中：凡读取或写入涉及污点（含传播/覆盖/清洗）之事件，均计入结果。
+        """
+        n = len(self.events)
+        if n == 0:
+            return []
+        i0 = max(0, min(start_idx, n - 1))
+        tainted_regs = set((r or '').lower() for r in source_regs)
+        tainted_mem = set(int(a) & 0xFFFFFFFF for a in source_mem_addrs)
+        hits: List[int] = []
+        steps = 0
+        base_call = self.events[i0].call_id
+
+        for i in range(i0, n):
+            if steps >= max_steps:
+                break
+            ev = self.events[i]
+            if same_call_only and ev.call_id != base_call:
+                continue
+            steps += 1
+            used = False
+
+            # 读取命中
+            for r in ev.reads.keys():
+                if r in tainted_regs:
+                    used = True
+                    break
+
+            # ldr 命中（从污点内存加载）
+            asm = ev.asm.lower()
+            eff = None
+            if asm.startswith('ldr'):
+                eff = self.effective_address(i)
+                if eff is not None and (eff & 0xFFFFFFFF) in tainted_mem:
+                    used = True
+
+            # 写入传播/清洗
+            if ev.writes:
+                for rd in list(ev.writes.keys()):
+                    propagated = False
+                    # 1) 来自污点寄存器的传播
+                    for rn in ev.reads.keys():
+                        if rn in tainted_regs:
+                            propagated = True
+                            break
+                    # 2) ldr 从污点内存传播
+                    if not propagated and asm.startswith('ldr'):
+                        if eff is None:
+                            eff = self.effective_address(i)
+                        if eff is not None and (eff & 0xFFFFFFFF) in tainted_mem:
+                            propagated = True
+                    if propagated:
+                        if rd not in tainted_regs:
+                            tainted_regs.add(rd)
+                        used = True
+                    else:
+                        # 3) 立即数覆盖清洗
+                        if self._is_immediate_write(ev, rd):
+                            if rd in tainted_regs:
+                                tainted_regs.discard(rd)
+                                used = True
+
+            # store 传播到内存
+            if asm.startswith('str'):
+                eff2 = self.effective_address(i)
+                if eff2 is not None:
+                    src_reg = self._parse_store_value_reg(asm)
+                    if src_reg and src_reg in tainted_regs:
+                        tainted_mem.add(eff2 & 0xFFFFFFFF)
+                        used = True
+
+            if used:
+                hits.append(i)
+
+        # 去重并保持顺序
+        seen = set()
+        ordered = []
+        for k in hits:
+            if k in seen:
+                continue
+            seen.add(k)
+            ordered.append(k)
+        return ordered
+
 
