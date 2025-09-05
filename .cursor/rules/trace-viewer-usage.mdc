@@ -1,4 +1,23 @@
 ---
+description: Trace Viewer 使用要点与工作流
+---
+# 使用要点
+
+- 打开 trace：`python3.8 -m trace_viewer.app` 或 `trace-viewer`。
+- 推荐流程：
+  1) 在 Unidbg 侧执行样本并生成 trace（如 [trace_viewer/fanqie_trace.txt](mdc:trace_viewer/fanqie_trace.txt)）。
+  2) 在 GUI 打开 trace，右侧使用值流面板进行污点前向分析或值路径分析。
+  3) 代码区右键“指定值追踪”支持锚点行同指令文本优先筛选。
+- 大文件操作：优先使用倒排索引/预计算 API，避免整文件扫描。
+
+# 面板说明
+
+- 值流追踪面板：[trace_viewer/value_flow.py](mdc:trace_viewer/value_flow.py)
+  - 主要列：行号、PC、方向、标记、表达式/指令、之前、之后、调用#、低8位变化、位运算摘要。
+  - 仅保留污点分析入口：`污点寄存器/污点内存/同调用` + “污点前向分析”。
+  - 结果渲染统一使用 `_classify_tag`/`_fmt_low8`/`_fmt_bitops`。
+
+---
 description: trace-viewer-usage
 ---
 # Unidbg Trace Viewer 使用提示

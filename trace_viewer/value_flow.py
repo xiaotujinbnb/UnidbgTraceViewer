@@ -29,8 +29,9 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.value_edit.setPlaceholderText('值（十六进制，如 0xfffffffb）')
         self.side_combo = QtWidgets.QComboBox()
         self.side_combo.addItems(['运行前', '运行后'])
-        self.btn_search = QtWidgets.QPushButton('追踪')
-        self.btn_search.clicked.connect(self._on_trace_value)
+        self.btn_search = QtWidgets.QPushButton('前向追踪')
+        self.btn_search.setToolTip('填写“寄存器+值”则按值追踪；否则使用下方污点输入做前向追踪')
+        self.btn_search.clicked.connect(self._on_forward)
         form.addWidget(self.input_edit)
         form.addWidget(self.value_edit)
         form.addWidget(self.side_combo)
@@ -38,9 +39,10 @@ class ValueFlowDock(QtWidgets.QDockWidget):
 
         # 结果列表
         self.list = QtWidgets.QTreeWidget()
-        self.list.setHeaderLabels(['行号', 'PC', '方向', '表达式/指令', '之前', '之后', '调用#', '低8位变化', '位运算摘要'])
+        self.list.setHeaderLabels(['行号', 'PC', '方向', '标记', '表达式/指令', '之前', '之后', '调用#', '低8位变化', '位运算摘要'])
         self.list.setColumnWidth(0, 80)
         self.list.setColumnWidth(1, 110)
+        self.list.setColumnWidth(3, 70)
         self.list.setColumnWidth(4, 110)
         self.list.setColumnWidth(5, 110)
         self.list.setColumnWidth(6, 70)
@@ -55,7 +57,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._on_list_context)
 
-        layout.addLayout(form)
+        # 隐藏“寄存器+值”输入栏：仅保留污点分析入口
         # 污点分析区域
         taint_form = QtWidgets.QHBoxLayout()
         self.taint_regs_edit = QtWidgets.QLineEdit()
@@ -65,7 +67,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.taint_samecall_chk = QtWidgets.QCheckBox('同调用内')
         self.taint_samecall_chk.setChecked(True)
         self.btn_taint = QtWidgets.QPushButton('污点前向分析')
-        self.btn_taint.clicked.connect(self._on_taint_run)
+        self.btn_taint.clicked.connect(self._on_forward)
         taint_form.addWidget(self.taint_regs_edit)
         taint_form.addWidget(self.taint_mem_edit)
         taint_form.addWidget(self.taint_samecall_chk)
@@ -83,15 +85,18 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.input_edit.textChanged.connect(self._update_trace_btn_state)
         self.value_edit.textChanged.connect(self._update_trace_btn_state)
 
-        # 导出按钮：伪C / Python
+        # 导出按钮：伪C / Python + 溯源
         btns = QtWidgets.QHBoxLayout()
         self.btn_export_python = QtWidgets.QPushButton('导出伪C代码')
         self.btn_export_python.clicked.connect(self._on_export_c)
         self.btn_export_py = QtWidgets.QPushButton('导出Python代码')
         self.btn_export_py.clicked.connect(self._on_export_py)
+        self.btn_prov = QtWidgets.QPushButton('溯源路径')
+        self.btn_prov.clicked.connect(self._on_provenance)
         btns.addStretch(1)
         btns.addWidget(self.btn_export_python)
         btns.addWidget(self.btn_export_py)
+        btns.addWidget(self.btn_prov)
         layout.addLayout(btns)
 
         # 异步链路计算与结果缓存
@@ -99,6 +104,8 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self._chain_req_id: int = 0
         self._chain_cache: "OrderedDict[str, List[int]]" = OrderedDict()
         self._chain_cache_cap = 32
+        # 溯源
+        self._prov_worker = None
 
     def set_font_point_size(self, point_size: int) -> None:
         """统一调整面板内主要控件的字体大小，用于与代码区同步缩放。"""
@@ -118,6 +125,12 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 wf = w.font()
                 wf.setPointSize(point_size)
                 w.setFont(wf)
+            try:
+                wf2 = self.btn_prov.font()
+                wf2.setPointSize(point_size)
+                self.btn_prov.setFont(wf2)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -127,9 +140,23 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.eval_effaddr_cb = eval_effaddr_cb
 
     def _on_search(self) -> None:
-        # 兼容旧按钮行为：直接执行值路径追踪
-        self._on_trace_value()
+        # 兼容旧按钮行为：统一走前向追踪
+        self._on_forward()
         self._update_trace_btn_state()
+
+    def _on_forward(self) -> None:
+        """统一入口：仅进行污点前向分析。"""
+        has_taint = bool((self.taint_regs_edit.text() or '').strip() or (self.taint_mem_edit.text() or '').strip())
+        if not has_taint:
+            QtWidgets.QMessageBox.information(self, '提示', '请在下方输入污点寄存器/内存')
+            return
+        sel = self.list.selectedItems()
+        start_idx = 0
+        if sel:
+            maybe = sel[0].data(0, QtCore.Qt.UserRole)
+            if isinstance(maybe, int):
+                start_idx = maybe
+        self._run_taint(start_idx=start_idx)
 
     def _search_register(self, reg: str, in_scope_fn, match_val: Optional[int], side_sel: str) -> None:
         reg = reg.lower()
@@ -157,8 +184,9 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                         continue
                 low8 = self._fmt_low8(reg, idx)
                 bitops = self._fmt_bitops(ev.asm)
+                tag = self._classify_tag(reg, idx)
                 item = QtWidgets.QTreeWidgetItem([
-                    str(ev.line_no), f'0x{ev.pc:08x}', rw, ev.asm,
+                    str(ev.line_no), f'0x{ev.pc:08x}', rw, tag, ev.asm,
                     '' if before is None else f"0x{before:08x}",
                     '' if after is None else f"0x{after:08x}",
                     str(getattr(ev, 'call_id', 0)),
@@ -186,8 +214,9 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 # 未指定寄存器的 memory 事件，仅填充调用号
                 low8 = self._fmt_low8(None, idx)
                 bitops = self._fmt_bitops(ev.asm)
+                tag = self._classify_tag(None, idx)
                 item = QtWidgets.QTreeWidgetItem([
-                    str(ev.line_no), f'0x{ev.pc:08x}', rw, ev.asm,
+                    str(ev.line_no), f'0x{ev.pc:08x}', rw, tag, ev.asm,
                     '', '', str(getattr(ev, 'call_id', 0)), low8, bitops
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
@@ -280,6 +309,8 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self._chain_worker = ChainWorker(self.parser, reg, start_idx, match_val, side_sel, req_id)
         self._chain_worker.finishedWithId.connect(self._on_chain_ready)
         self._chain_worker.start()
+        # 保存上下文，便于解释
+        self._last_trace_ctx = {'reg': reg, 'start_idx': start_idx, 'match_val': match_val, 'side': side_sel}
 
     def _select_candidate_dialog(self, reg: str, val: int, side_sel: str, cands: List[Tuple[int, object, Optional[int], Optional[int]]]) -> Optional[int]:
         dlg = QtWidgets.QDialog(self)
@@ -385,10 +416,11 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         return ' '.join(parts)
 
     def _update_trace_btn_state(self) -> None:
-        # 仅当存在寄存器名和值时允许追踪
+        # 存在“寄存器+值”，或有污点输入时允许追踪
         has_reg = bool((self.input_edit.text() or '').strip())
         has_val = bool((self.value_edit.text() or '').strip())
-        self.btn_search.setEnabled(has_reg and has_val)
+        has_taint = bool((self.taint_regs_edit.text() or '').strip() or (self.taint_mem_edit.text() or '').strip())
+        self.btn_search.setEnabled((has_reg and has_val) or has_taint)
 
     def _on_chain_ready(self, indices: List[int], reg: str, req_id: int) -> None:
         if req_id != self._chain_req_id:
@@ -398,6 +430,35 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         cache_key = f"{reg}|{indices[0] if indices else 0}"
         # 渲染
         self._render_chain_list_fast(reg, indices)
+        # 附带来源解释
+        try:
+            ctx = getattr(self, '_last_trace_ctx', None)
+            if ctx and self.parser and indices:
+                info = self.parser.analyze_value_origin(ctx['reg'], ctx['start_idx'], ctx['match_val'], ctx['side'])
+                self._show_origin_info(info)
+        except Exception:
+            pass
+
+    def _show_origin_info(self, info: dict) -> None:
+        if not isinstance(info, dict):
+            return
+        lines = []
+        d = info.get('direct')
+        if d:
+            lines.append(f"直接来源：{d}")
+        for it in info.get('indirect', []) or []:
+            lines.append(str(it))
+        gaps = info.get('gaps', []) or []
+        for g in gaps:
+            if isinstance(g, dict):
+                lines.append(f"溯源缺口：{g.get('type')} {g.get('addr')} {g.get('hint','')}")
+            else:
+                lines.append(str(g))
+        if lines:
+            try:
+                self.parent().statusBar().showMessage(' | '.join(lines)[:300], 6000)  # type: ignore[union-attr]
+            except Exception:
+                QtWidgets.QToolTip.showText(self.mapToGlobal(QtCore.QPoint(0, 0)), ' | '.join(lines)[:300])
 
     def _render_chain_list_fast(self, reg: str, chain_indices: List[int]) -> None:
         self.list.setUpdatesEnabled(False)
@@ -409,8 +470,9 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 after = ev.writes.get(reg)
                 rw = 'W' if reg in ev.writes else ('R' if reg in ev.reads else '')
                 asm = self._fmt_with_reg_context(ev, reg, before, after)
+                tag = self._classify_tag(reg, idx)
                 item = QtWidgets.QTreeWidgetItem([
-                    str(ev.line_no), f"0x{ev.pc:08x}", rw, asm,
+                    str(ev.line_no), f"0x{ev.pc:08x}", rw, tag, asm,
                     '' if before is None else f"0x{before:08x}",
                     '' if after is None else f"0x{after:08x}",
                     str(getattr(ev, 'call_id', 0)),
@@ -421,6 +483,45 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         finally:
             self.list.setUpdatesEnabled(True)
             self.list.viewport().update()
+
+    # === 终止条件与节点标注 ===
+    def _classify_tag(self, reg: Optional[str], idx: int) -> str:
+        if not self.parser:
+            return ''
+        ev = self.parser.events[idx]
+        s = ev.asm.lower()
+        # 1) 初始数据源
+        if reg:
+            if self.parser._is_immediate_write(ev, reg) or self.parser._is_constant_zero_write(ev, reg):
+                return '源头'
+        # rodata/常量内存（通过“无前序 store”的ldr识别）
+        if s.startswith('ldr') and (not ev.writes or (reg and reg in ev.writes)):
+            try:
+                if self.parser._is_load_from_const_memory(idx, reg or next(iter(ev.writes.keys()), '')):
+                    return '常量'
+            except Exception:
+                pass
+        # 2) 系统/外部边界（粗识别：svc/bl libc 符号不可用时退化为空）
+        if s.startswith('svc'):
+            return '边界'
+        try:
+            if s.startswith('bl '):
+                return '调用-外' if self.parser.is_external_call(idx) else '调用'
+        except Exception:
+            pass
+        # 3) 循环/递归起点（简单：同一 asm 在短窗口内重复）
+        try:
+            if self.parser.is_loop_head(idx, window=32):
+                return '循环'
+        except Exception:
+            pass
+        # 4) 栈地址访问提示
+        try:
+            if self.parser.is_stack_address(idx):
+                return '栈'
+        except Exception:
+            pass
+        return ''
 
     def _set_busy(self, busy: bool) -> None:
         if busy:
@@ -519,6 +620,121 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 start_idx = maybe
         self._run_taint(start_idx=start_idx)
 
+    # === 溯源入口 ===
+    def _on_provenance(self) -> None:
+        if not self.parser:
+            return
+        sel = self.list.selectedItems()
+        if sel:
+            idx = sel[0].data(0, QtCore.Qt.UserRole)
+        else:
+            idx = 0
+        if not isinstance(idx, int):
+            idx = 0
+        reg, ok = QtWidgets.QInputDialog.getText(self, '溯源', '输入寄存器名（如 r1/x0）：')
+        if not ok or not reg:
+            return
+        reg = reg.strip().lower()
+        side = '执行后'
+        self._set_busy(True)
+        try:
+            if self._prov_worker and self._prov_worker.isRunning():
+                self._prov_worker.requestInterruption()
+        except Exception:
+            pass
+        self._prov_worker = _ProvenanceWorker(self.parser, reg, idx, side)
+        self._prov_worker.finishedWithPath.connect(self._on_provenance_ready)
+        self._prov_worker.start()
+
+    @QtCore.pyqtSlot(object)
+    def _show_save_dialog(self, content: str) -> None:
+        # 替换为导出 trace 文本
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle('导出溯源路径为 trace')
+        lay = QtWidgets.QVBoxLayout(dlg)
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlainText(content)
+        lay.addWidget(edit)
+        btns = QtWidgets.QHBoxLayout()
+        btn_copy = QtWidgets.QPushButton('复制到剪贴板')
+        btn_save = QtWidgets.QPushButton('保存为 .trace')
+        btn_copy.clicked.connect(lambda: (QtWidgets.QApplication.clipboard().setText(edit.toPlainText()), QtWidgets.QMessageBox.information(dlg, '已复制', '内容已复制')))
+        def _save():
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(dlg, '保存为 .trace', 'provenance.trace', 'Trace Files (*.trace *.txt);;All Files (*)')
+            if path:
+                try:
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(edit.toPlainText())
+                    QtWidgets.QMessageBox.information(dlg, '已保存', f'已保存到\n{path}')
+                except Exception as e:
+                    QtWidgets.QMessageBox.critical(dlg, '保存失败', str(e))
+        btn_save.clicked.connect(_save)
+        btns.addStretch(1)
+        btns.addWidget(btn_copy)
+        btns.addWidget(btn_save)
+        lay.addLayout(btns)
+        dlg.resize(760, 560)
+        dlg.exec_()
+
+    @QtCore.pyqtSlot(list, list, str)
+    def _on_provenance_ready(self, nodes_edges_reg: list, edges: list = None, reg: str = '') -> None:
+        self._set_busy(False)
+        # 兼容信号打包参数（使用 _ProvenanceWorker 的签名）
+        if edges is None and isinstance(nodes_edges_reg, list):
+            indices = nodes_edges_reg
+        else:
+            indices = nodes_edges_reg or []
+        if not indices:
+            QtWidgets.QMessageBox.information(self, '溯源', '未能构建溯源路径')
+            return
+        self.list.setUpdatesEnabled(False)
+        try:
+            self.list.clear()
+            for idx in indices:
+                ev = self.parser.events[idx]
+                before = ev.reads.get(reg) if reg else None
+                after = ev.writes.get(reg) if reg else None
+                asm = self._fmt_with_reg_context(ev, reg, before, after)
+                rw = 'W' if reg in ev.writes else ('R' if reg in ev.reads else '')
+                tag = '[溯源]'
+                item = QtWidgets.QTreeWidgetItem([
+                    str(ev.line_no), f"0x{ev.pc:08x}", rw, tag, asm,
+                    '' if before is None else f"0x{before:08x}",
+                    '' if after is None else f"0x{after:08x}",
+                    str(getattr(ev, 'call_id', 0)),
+                    self._fmt_low8(reg, idx), self._fmt_bitops(ev.asm)
+                ])
+                item.setData(0, QtCore.Qt.UserRole, idx)
+                self.list.addTopLevelItem(item)
+            # 直接导出原始 trace 文本（按执行顺序）
+            try:
+                txt = self._build_trace_text(indices)
+                self._show_save_dialog(txt)
+            except Exception:
+                pass
+        finally:
+            self.list.setUpdatesEnabled(True)
+            self.list.viewport().update()
+
+    def _build_trace_text(self, indices: list) -> str:
+        lines = []
+        for idx in indices:
+            ev = self.parser.events[idx]
+            raw = ev.raw or ''
+            if not raw:
+                left = ' '.join([f"{k}=0x{v:08x}" for k, v in sorted(ev.reads.items())])
+                right = ' '.join([f"{k}=0x{v:08x}" for k, v in sorted(ev.writes.items())])
+                rest = ''
+                if left and right:
+                    rest = f" {left} => {right}"
+                elif left:
+                    rest = f" {left}"
+                elif right:
+                    rest = f"  => {right}"
+                raw = f"[{ev.timestamp}][{ev.module} {ev.module_offset}] [{ev.encoding}] 0x{ev.pc:08x}: \"{ev.asm}\"{rest}"
+            lines.append(raw)
+        return '\n'.join(lines)
+
     def _parse_taint_inputs(self) -> tuple:
         regs_txt = (self.taint_regs_edit.text() or '').strip()
         mem_txt = (self.taint_mem_edit.text() or '').strip()
@@ -562,8 +778,9 @@ class ValueFlowDock(QtWidgets.QDockWidget):
             for idx in hits:
                 ev = self.parser.events[idx]
                 rw = 'W' if ev.writes else ('R' if ev.reads else '')
+                tag = self._classify_tag(None, idx)
                 item = QtWidgets.QTreeWidgetItem([
-                    str(ev.line_no), f"0x{ev.pc:08x}", rw, ev.asm,
+                    str(ev.line_no), f"0x{ev.pc:08x}", rw, tag, ev.asm,
                     '', '', str(getattr(ev, 'call_id', 0)), self._fmt_low8(None, idx), self._fmt_bitops(ev.asm)
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
@@ -1243,4 +1460,23 @@ class TaintWorker(QtCore.QThread):
         if not self.isInterruptionRequested():
             self.finishedWithHits.emit(hits)
 
+
+
+class _ProvenanceWorker(QtCore.QThread):
+    finishedWithPath = QtCore.pyqtSignal(list, list, str)
+
+    def __init__(self, parser, reg: str, start_idx: int, side: str) -> None:
+        super().__init__()
+        self._parser = parser
+        self._reg = (reg or '').lower()
+        self._idx = int(start_idx)
+        self._side = side
+
+    def run(self) -> None:
+        try:
+            nodes, edges = self._parser.build_provenance_graph(self._reg, self._idx, self._side, max_nodes=5000)
+        except Exception:
+            nodes, edges = [], []
+        if not self.isInterruptionRequested():
+            self.finishedWithPath.emit(nodes, edges, self._reg)
 

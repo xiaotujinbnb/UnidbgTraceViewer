@@ -6,6 +6,11 @@ from typing import Dict, List, Tuple, Optional, Iterable
 import threading
 import time
 from collections import OrderedDict
+import logging
+try:
+    from .decoders import get_decoder
+except Exception:
+    get_decoder = None  # 回退
 
 
 @dataclass
@@ -81,6 +86,9 @@ class TraceParser:
         self._effaddr_cache_cap: int = 8192
         # store 地址索引：addr -> 已排序的事件索引列表（仅 str* 指令）
         self.store_addr_index: Dict[int, List[int]] = {}
+        # 解码器回退日志（限频）
+        self._decoder_warn_counts: Dict[str, int] = {}
+        self._decoder_warn_limit: int = 20
 
     def parse_file(self, path: str, progress_cb: Optional[callable] = None) -> None:
         """解析 trace 文件并构建索引；若存在可用 SQLite 缓存则直接加载。"""
@@ -253,12 +261,12 @@ class TraceParser:
         ev.call_depth = len(self._call_stack)
         ev.call_id = self._call_stack[-1] if self._call_stack else 0
 
-        # 根据当前指令调整调用栈
-        if self._is_call_insn(asm):
+        # 根据当前指令调整调用栈（优先解码器，失败回退字符串判断）
+        if self._is_call_event(ev):
             self._call_stack.append(self._next_call_id)
             self._next_call_id += 1
             return
-        if self._is_return_insn(asm):
+        if self._is_return_event(ev):
             if self._call_stack:
                 self._call_stack.pop()
 
@@ -279,6 +287,54 @@ class TraceParser:
         if asm.startswith('ldm') and 'pc' in asm:
             return True
         return False
+
+    # === 解码器辅助（带退化日志） ===
+    def _decode_event(self, ev: TraceEvent):
+        try:
+            if get_decoder is None:
+                return None
+            enc_hex = (ev.encoding or '').replace(' ', '')
+            if not enc_hex:
+                return None
+            dec = get_decoder()
+            enc = bytes.fromhex(enc_hex)
+            thumb = (len(enc) == 2) and (self.arch == 'arm32')
+            return dec.decode(ev.pc, enc, self.arch if self.arch != 'auto' else 'arm32', thumb)
+        except Exception:
+            return None
+
+    def _warn_decoder(self, reason: str, ev: TraceEvent, exc: Optional[Exception] = None) -> None:
+        try:
+            cnt = self._decoder_warn_counts.get(reason, 0)
+            if cnt < self._decoder_warn_limit:
+                logging.getLogger(__name__).warning(
+                    "decoder fallback (%s) at line=%d pc=0x%08x asm=%s%s",
+                    reason, ev.line_no, ev.pc, ev.asm,
+                    f" err={exc}" if exc else ""
+                )
+                self._decoder_warn_counts[reason] = cnt + 1
+            elif cnt == self._decoder_warn_limit:
+                logging.getLogger(__name__).warning(
+                    "decoder fallback (%s) warnings exceeded limit; suppressing further logs",
+                    reason
+                )
+                self._decoder_warn_counts[reason] = cnt + 1
+        except Exception:
+            pass
+
+    def _is_call_event(self, ev: TraceEvent) -> bool:
+        ins = self._decode_event(ev)
+        if ins is None:
+            self._warn_decoder('call_decode_unavailable', ev)
+            return self._is_call_insn(ev.asm.lower())
+        return bool(getattr(ins, 'is_call', False))
+
+    def _is_return_event(self, ev: TraceEvent) -> bool:
+        ins = self._decode_event(ev)
+        if ins is None:
+            self._warn_decoder('ret_decode_unavailable', ev)
+            return self._is_return_insn(ev.asm.lower())
+        return bool(getattr(ins, 'is_ret', False))
 
     def _parse_line(self, line_no: int, line: str) -> Optional[TraceEvent]:
         m = self.LINE_RE.match(line)
@@ -691,6 +747,296 @@ class TraceParser:
             return []
         return self.build_value_chain_fast(reg, event_index, val & 0xFFFFFFFF, side)
 
+    # === 反向溯源（Backward Dynamic Slice） ===
+    def build_provenance_backtrace(self,
+                                   reg: str,
+                                   start_idx: int,
+                                   side: str = '执行后',
+                                   max_nodes: int = 4000) -> List[int]:
+        """从指定事件与寄存器出发，回溯其值的来源路径（寄存器/内存）。
+
+        规则：
+        - 若定义来自立即数/恒零归约：作为叶子停止；
+        - 若定义来自 ldr：找到上一次对该地址的 store，将其加入路径，并继续回溯 store 的源寄存器；
+        - 若定义来自算术/位运算：对所有读取寄存器回溯其上一次写入；
+        返回：涉及的事件索引（去重、按时间排序）。
+        """
+        reg = (reg or '').lower()
+        n = len(self.events)
+        if n == 0:
+            return []
+        start_idx = max(0, min(start_idx, n - 1))
+
+        # 取起点值（用于定位对应写入点）
+        ev0 = self.events[start_idx]
+        v_before = ev0.reads.get(reg)
+        v_after = ev0.writes.get(reg)
+        if side == '执行后' and v_after is not None:
+            want_val = v_after & 0xFFFFFFFF
+        elif v_before is not None:
+            want_val = v_before & 0xFFFFFFFF
+        else:
+            # 回退复原
+            ref = self.reconstruct_regs_at(start_idx if side == '执行后' else (start_idx - 1))
+            want_val = ref.get(reg)
+            if want_val is None:
+                return []
+            want_val &= 0xFFFFFFFF
+
+        # 定位写入该值的定义点
+        writer_idx: Optional[int] = None
+        if side == '执行后':
+            if reg in ev0.writes and (ev0.writes.get(reg) & 0xFFFFFFFF) == want_val:
+                writer_idx = start_idx
+        if writer_idx is None:
+            j = self.find_prev_write(reg, start_idx)
+            while j is not None:
+                evj = self.events[j]
+                valj = evj.writes.get(reg)
+                if valj is not None and (valj & 0xFFFFFFFF) == want_val:
+                    writer_idx = j
+                    break
+                j = self.find_prev_write(reg, j)
+        if writer_idx is None:
+            writer_idx = start_idx
+
+        # 回溯工作栈
+        work: List[Tuple[str, int]] = [(reg, writer_idx)]
+        seen_keys = set()
+        nodes: List[int] = []
+
+        guard = 0
+        while work and guard < max_nodes:
+            guard += 1
+            cur_reg, cur_idx = work.pop()
+            key = (cur_reg, cur_idx)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if cur_idx not in nodes:
+                nodes.append(cur_idx)
+
+            ev = self.events[cur_idx]
+            s = ev.asm.lower()
+
+            # 立即数/恒零：叶子
+            if self._is_constant_zero_write(ev, cur_reg) or self._is_immediate_write(ev, cur_reg):
+                continue
+
+            # ldr：回溯 store 源
+            if s.startswith('ldr') and cur_reg in ev.writes:
+                addr = self.effective_address(cur_idx)
+                if addr is None:
+                    # 地址不可解析，视为叶子
+                    continue
+                store_idx = self._find_prev_store_to_address(addr, cur_idx, same_call_id=ev.call_id)
+                if store_idx is None:
+                    store_idx = self._find_prev_store_to_address(addr, cur_idx, max_steps=6000, same_call_id=None)
+                if store_idx is not None:
+                    if store_idx not in nodes:
+                        nodes.append(store_idx)
+                    src_reg = self._parse_store_value_reg(self.events[store_idx].asm)
+                    if src_reg:
+                        prev = self.find_prev_write(src_reg, store_idx)
+                        if prev is not None:
+                            work.append((src_reg, prev))
+                continue
+
+            # 算术/位运算：回溯所有读取寄存器
+            if ev.reads:
+                for src_reg in list(ev.reads.keys()):
+                    prev = self.find_prev_write(src_reg, cur_idx)
+                    if prev is not None:
+                        work.append((src_reg, prev))
+
+        # 输出按事件时间排序，去重
+        nodes = sorted(set(nodes))
+        return nodes
+
+    def build_provenance_graph(self,
+                               reg: str,
+                               start_idx: int,
+                               side: str = '执行后',
+                               max_nodes: int = 4000) -> Tuple[List[int], List[Tuple[str, int, int, str]]]:
+        """与 build_provenance_backtrace 类似，但同时返回边集合。
+
+        返回：
+          nodes: 事件索引（有序、去重）
+          edges: 列表 (etype, src_idx, dst_idx, meta)
+                 - etype: 'data' | 'mem'
+                 - meta:  对 data 为寄存器名；对 mem 为 0x... 地址字符串
+        """
+        reg = (reg or '').lower()
+        n = len(self.events)
+        if n == 0:
+            return [], []
+        start_idx = max(0, min(start_idx, n - 1))
+
+        ev0 = self.events[start_idx]
+        v_before = ev0.reads.get(reg)
+        v_after = ev0.writes.get(reg)
+        if side == '执行后' and v_after is not None:
+            want_val = v_after & 0xFFFFFFFF
+        elif v_before is not None:
+            want_val = v_before & 0xFFFFFFFF
+        else:
+            ref = self.reconstruct_regs_at(start_idx if side == '执行后' else (start_idx - 1))
+            want_val = ref.get(reg)
+            if want_val is None:
+                return [], []
+            want_val &= 0xFFFFFFFF
+
+        writer_idx: Optional[int] = None
+        if side == '执行后':
+            if reg in ev0.writes and (ev0.writes.get(reg) & 0xFFFFFFFF) == want_val:
+                writer_idx = start_idx
+        if writer_idx is None:
+            j = self.find_prev_write(reg, start_idx)
+            while j is not None:
+                evj = self.events[j]
+                valj = evj.writes.get(reg)
+                if valj is not None and (valj & 0xFFFFFFFF) == want_val:
+                    writer_idx = j
+                    break
+                j = self.find_prev_write(reg, j)
+        if writer_idx is None:
+            writer_idx = start_idx
+
+        work: List[Tuple[str, int]] = [(reg, writer_idx)]
+        seen_keys = set()
+        nodes: List[int] = []
+        edges: List[Tuple[str, int, int, str]] = []
+
+        guard = 0
+        while work and guard < max_nodes:
+            guard += 1
+            cur_reg, cur_idx = work.pop()
+            key = (cur_reg, cur_idx)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            if cur_idx not in nodes:
+                nodes.append(cur_idx)
+
+            ev = self.events[cur_idx]
+            s = ev.asm.lower()
+
+            if self._is_constant_zero_write(ev, cur_reg) or self._is_immediate_write(ev, cur_reg):
+                continue
+
+            if s.startswith('ldr') and cur_reg in ev.writes:
+                addr = self.effective_address(cur_idx)
+                if addr is None:
+                    continue
+                store_idx = self._find_prev_store_to_address(addr, cur_idx, same_call_id=ev.call_id)
+                if store_idx is None:
+                    store_idx = self._find_prev_store_to_address(addr, cur_idx, max_steps=6000, same_call_id=None)
+                if store_idx is not None:
+                    if store_idx not in nodes:
+                        nodes.append(store_idx)
+                    edges.append(('mem', store_idx, cur_idx, f"0x{addr & 0xFFFFFFFF:08x}"))
+                    src_reg = self._parse_store_value_reg(self.events[store_idx].asm)
+                    if src_reg:
+                        prev = self.find_prev_write(src_reg, store_idx)
+                        if prev is not None:
+                            edges.append(('data', prev, store_idx, src_reg))
+                            work.append((src_reg, prev))
+                continue
+
+            if ev.reads:
+                for src_reg in list(ev.reads.keys()):
+                    prev = self.find_prev_write(src_reg, cur_idx)
+                    if prev is not None:
+                        edges.append(('data', prev, cur_idx, src_reg))
+                        work.append((src_reg, prev))
+
+        nodes = sorted(set(nodes))
+        # 去重 edges（稳定顺序）
+        seen_e = set()
+        ordered_edges = []
+        for et, u, v, m in edges:
+            key = (et, u, v, m)
+            if key in seen_e:
+                continue
+            seen_e.add(key)
+            ordered_edges.append((et, u, v, m))
+        return nodes, ordered_edges
+
+    # === 值来源解释（面向 UI 显示） ===
+    def analyze_value_origin(self, reg: str, start_idx: int, value_u32: int, side: str = '执行前') -> Dict[str, object]:
+        """给出“直接来源 / 间接依赖 / 溯源缺口”的简要解释。
+
+        直接来源：若起点定义是 ldr，报告有效地址；若是算术，报告表达式与参与寄存器；若是立即数，报告字面量。
+        间接依赖：给出寻址依赖寄存器值（base/index/imm）或算术参与寄存器快照。
+        溯源缺口：列出需要继续追的内存地址（找上次 store）与栈地址（找更早的 str）。
+        """
+        result: Dict[str, object] = {
+            'direct': '',
+            'indirect': [],
+            'gaps': [],
+        }
+        n = len(self.events)
+        if n == 0:
+            return result
+        start_idx = max(0, min(start_idx, n - 1))
+
+        # 找写入该值的定义点
+        writer_idx: Optional[int] = None
+        if side == '执行后' and reg in self.events[start_idx].writes and (self.events[start_idx].writes.get(reg) & 0xFFFFFFFF) == (value_u32 & 0xFFFFFFFF):
+            writer_idx = start_idx
+        if writer_idx is None:
+            j = self.find_prev_write(reg, start_idx)
+            while j is not None:
+                evj = self.events[j]
+                valj = evj.writes.get(reg)
+                if valj is not None and (valj & 0xFFFFFFFF) == (value_u32 & 0xFFFFFFFF):
+                    writer_idx = j
+                    break
+                j = self.find_prev_write(reg, j)
+        if writer_idx is None:
+            writer_idx = start_idx
+
+        evw = self.events[writer_idx]
+        s = evw.asm.lower()
+        regs_at = self.reconstruct_regs_at(writer_idx)
+
+        # 1) ldr 直接来源：有效地址
+        if s.startswith('ldr') and reg in evw.writes:
+            addr = self.effective_address(writer_idx)
+            if addr is not None:
+                result['direct'] = f"从内存 0x{addr:08x} 加载"
+                # 尝试构造 base/index/imm 解释（粗略从 reads 取前两个）
+                reads = list(evw.reads.keys())
+                base = reads[0] if reads else None
+                index = reads[1] if len(reads) >= 2 else None
+                if base:
+                    bval = regs_at.get(base)
+                    ctx = f"{base}=0x{bval:08x}" if bval is not None else base
+                    if index:
+                        ival = regs_at.get(index)
+                        result['indirect'].append(f"地址依赖：{ctx}, {index}=0x{(ival or 0):08x}")
+                    else:
+                        result['indirect'].append(f"地址依赖：{ctx}")
+                # 缺口：该地址上一次写入
+                result['gaps'].append({'type': 'mem', 'addr': f"0x{addr:08x}", 'hint': '查找更早的 store/写入'})
+            return result
+
+        # 2) 立即数 / 恒零
+        if self._is_immediate_write(evw, reg) or self._is_constant_zero_write(evw, reg):
+            result['direct'] = '立即数装载/恒等归零'
+            return result
+
+        # 3) 算术/位运算：记录参与寄存器
+        if evw.reads:
+            parts = []
+            for r in list(evw.reads.keys())[:3]:
+                v = regs_at.get(r)
+                parts.append(f"{r}=0x{(v or 0):08x}")
+            result['direct'] = '算术/位运算结果'
+            if parts:
+                result['indirect'].append('参与寄存器：' + ', '.join(parts))
+        return result
+
     # === 源判定与有效地址 ===
     def _is_immediate_write(self, ev: TraceEvent, reg: str) -> bool:
         if reg not in ev.writes:
@@ -699,7 +1045,60 @@ class TraceParser:
         if '#' not in s:
             return False
         # 常见包含立即数的写入/合成指令
-        return any(s.startswith(op) for op in ('mov', 'mvn', 'orr', 'eor', 'and', 'add', 'sub', 'movw', 'movt'))
+        # 注：arm64 的 movz/movn 属于立即数装载，会覆盖目标寄存器；movk 只修改部分位，不视为清洗
+        return any(s.startswith(op) for op in (
+            'mov ', 'mvn ', 'orr ', 'eor ', 'and ', 'add ', 'sub ', 'movw', 'movt', 'movz', 'movn'
+        ))
+
+    def _is_constant_zero_write(self, ev: TraceEvent, reg: str) -> bool:
+        """判断本条写入是否将 reg 设为与任何输入无关的“常量 0”。
+
+        覆盖若干常见等式归约：
+        - mov rd, xzr/wzr            -> 0
+        - eor rd, rn, rn             -> 0
+        - sub/rsb rd, rn, rn         -> 0
+        - bic rd, rn, rn             -> 0   (rn & ~rn)
+        - and rd, rn, #0             -> 0
+        - mov rd, #0                 -> 属于 _is_immediate_write 覆盖，此处不重复判断
+        """
+        if reg not in ev.writes:
+            return False
+        s = ev.asm.lower().strip()
+        import re as _re
+        # 通用二参：op rd, rn
+        m2 = _re.match(r"^(\w+)\s+(\w+)\s*,\s*([^,]+)$", s)
+        # 通用三参：op rd, rn, rm/operand2
+        m3 = _re.match(r"^(\w+)\s+(\w+)\s*,\s*([^,]+)\s*,\s*(.+)$", s)
+
+        def _is_zero_imm(txt: str) -> bool:
+            t = txt.replace('#', '').strip()
+            try:
+                if t.startswith('0x'):
+                    return int(t, 16) == 0
+                return int(t, 10) == 0
+            except Exception:
+                return False
+
+        # mov rd, xzr/wzr
+        if m2 and m2.group(1) == 'mov' and m2.group(2) == reg:
+            rn = m2.group(3).strip()
+            if rn in ('xzr', 'wzr'):
+                return True
+        # and rd, rn, #0
+        if m3 and m3.group(1) == 'and' and m3.group(2) == reg:
+            rm = m3.group(4).strip()
+            if _is_zero_imm(rm):
+                return True
+        # eor/sub/rsb/bic rd, rn, rn
+        if m3 and m3.group(2) == reg:
+            op = m3.group(1)
+            rn = m3.group(3).strip().rstrip(',')
+            rm = m3.group(4).strip()
+            if rm.endswith(','):
+                rm = rm[:-1].strip()
+            if rm == rn and op in ('eor', 'sub', 'rsb', 'bic'):
+                return True
+        return False
 
     def _is_load_from_const_memory(self, event_index: int, reg: str) -> bool:
         ev = self.events[event_index]
@@ -709,22 +1108,56 @@ class TraceParser:
         addr = self.effective_address(event_index)
         if addr is None:
             return False
-        # 向前查找是否有对同一地址的 store；若没有，则视作常量来源
-        # 增加扫描上限，避免在超长 trace 上造成明显卡顿
-        scan_steps = 0
-        max_steps = 2000
-        for j in range(event_index - 1, -1, -1):
-            if scan_steps >= max_steps:
-                break
-            evj = self.events[j]
-            sj = evj.asm.lower()
-            if not sj.startswith('str'):
-                continue
-            scan_steps += 1
-            a = self.effective_address(j)
-            if a == addr:
-                return False
-        return True
+        # 优先使用预建索引：若该地址在整个 trace 中没有任何 store，或在本次 ldr 之前没有 store，则视为常量来源
+        lst = self.store_addr_index.get(addr)
+        if not lst:
+            return True
+        from bisect import bisect_left
+        pos = bisect_left(lst, event_index) - 1
+        return pos < 0
+
+    # === 辅助：边界与循环/栈等识别 ===
+    def _bl_target_addr(self, asm: str) -> Optional[int]:
+        try:
+            m = self.DIRECT_ADDR_RE.search(asm)
+            if m:
+                return int(m.group(1), 16)
+        except Exception:
+            return None
+        return None
+
+    def is_external_call(self, event_index: int) -> bool:
+        ev = self.events[event_index]
+        s = ev.asm.lower()
+        if not s.startswith('bl'):
+            return False
+        tgt = self._bl_target_addr(s)
+        if tgt is None:
+            return False
+        # 不在 addr_index 视为外部/未跟踪函数
+        return self.addr_index.get(tgt) is None
+
+    def is_loop_head(self, event_index: int, window: int = 32) -> bool:
+        pc = self.events[event_index].pc
+        lo = max(0, event_index - window)
+        for j in range(event_index - 1, lo - 1, -1):
+            if self.events[j].pc == pc:
+                return True
+        return False
+
+    def is_stack_address(self, event_index: int) -> bool:
+        ev = self.events[event_index]
+        if not (ev.asm.lower().startswith('ldr') or ev.asm.lower().startswith('str')):
+            return False
+        # 基于读取集包含 sp 或 地址接近 sp 的启发式
+        regs = self.reconstruct_regs_at(event_index)
+        sp = regs.get('sp')
+        addr = self.effective_address(event_index)
+        if 'sp' in ev.reads:
+            return True
+        if sp is not None and addr is not None:
+            return abs(((addr & 0xFFFFFFFF) - (sp & 0xFFFFFFFF)) & 0xFFFFFFFF) < 0x8000
+        return False
 
     def effective_address(self, event_index: int) -> Optional[int]:
         if event_index < 0 or event_index >= len(self.events):
@@ -738,6 +1171,47 @@ class TraceParser:
         asm = ev.asm.lower()
         if not (asm.startswith('str') or asm.startswith('ldr')):
             return None
+        # 优先尝试解码器（若可用），并记录退化原因
+        try:
+            if get_decoder is not None and ev.encoding:
+                dec = get_decoder()
+                enc_hex = ev.encoding.replace(' ', '')
+                enc = bytes.fromhex(enc_hex)
+                thumb = (len(enc) == 2) and (self.arch == 'arm32')
+                ins = dec.decode(ev.pc, enc, self.arch if self.arch != 'auto' else 'arm32', thumb)
+                if ins is None:
+                    self._warn_decoder('effaddr_decode_none', ev)
+                elif not getattr(ins, 'mem_ops', None):
+                    self._warn_decoder('effaddr_no_memops', ev)
+                else:
+                    regs = self.reconstruct_regs_at(event_index)
+                    base = None
+                    index = None
+                    shift = 0
+                    imm = 0
+                    # 先占位读取 mem_ops（未来可解析 base/index/imm/shift）
+                    for r in ev.reads.keys():
+                        if base is None:
+                            base = r
+                        elif index is None:
+                            index = r
+                    b = regs.get((base or '').lower()) if base else None
+                    i = regs.get((index or '').lower()) if index else None
+                    if b is None:
+                        self._warn_decoder('effaddr_missing_base', ev)
+                    else:
+                        val = (b + ((i or 0) << shift) + imm) & 0xFFFFFFFF
+                        self._effaddr_cache[event_index] = val
+                        if len(self._effaddr_cache) > self._effaddr_cache_cap:
+                            try:
+                                self._effaddr_cache.popitem(last=False)
+                            except Exception:
+                                self._effaddr_cache.clear()
+                        return val
+            else:
+                self._warn_decoder('effaddr_decoder_unavailable', ev)
+        except Exception as e:
+            self._warn_decoder('effaddr_exception', ev, e)
         # 若已预计算，直接返回并写入 LRU
         if ev.effaddr is not None:
             self._effaddr_cache[event_index] = ev.effaddr
@@ -894,6 +1368,13 @@ class TraceParser:
             # 写入传播/清洗
             if ev.writes:
                 for rd in list(ev.writes.keys()):
+                    # 0) 特殊恒等归约：将值置零，独立于输入 -> 清洗污点
+                    if self._is_constant_zero_write(ev, rd):
+                        if rd in tainted_regs:
+                            tainted_regs.discard(rd)
+                            used = True
+                        # 即使 reads 命中污点，此处也不传播（结果恒定为 0）
+                        continue
                     propagated = False
                     # 1) 来自污点寄存器的传播
                     for rn in ev.reads.keys():
@@ -911,7 +1392,7 @@ class TraceParser:
                             tainted_regs.add(rd)
                         used = True
                     else:
-                        # 3) 立即数覆盖清洗
+                        # 3) 立即数覆盖清洗（不依赖污点输入）
                         if self._is_immediate_write(ev, rd):
                             if rd in tainted_regs:
                                 tainted_regs.discard(rd)

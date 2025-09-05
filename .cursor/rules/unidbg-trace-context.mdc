@@ -1,4 +1,15 @@
 ---
+description: Unidbg trace 上下文、关键 PC、内存槽位、orig_low8 与校验代码
+---
+# Unidbg trace 分析上下文
+
+- 关键 PC 与模块：先定位关键 PC/指令，再回溯寄存器与表地址。
+- 内存槽位与有效地址：优先使用解析器预计算 `effective_address(idx)`。
+- 低 8 位变化：结果列“低8位变化”来自 `_fmt_low8`，便于快速识别掩码类运算。
+- 位运算摘要：`_fmt_bitops(asm)` 粗粒度识别 and/or/eor/移位等。
+- 值路径溯源：`build_value_chain_phase1` + `_classify_tag`，必要时用 `build_provenance_graph` 输出路径文本。
+
+---
 alwaysApply: false
 description: Unidbg trace 上下文、关键 PC、内存槽位、orig_low8 与校验代码
 ---

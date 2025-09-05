@@ -1,3 +1,16 @@
+.venv/
+__pycache__/
+.trace_cache/
+.mypy_cache/
+.pytest_cache/
+
+# local demo and large traces
+trace_viewer/demo/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/
 # Python
 __pycache__/
 *.py[cod]

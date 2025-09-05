@@ -1,5 +1,37 @@
 ---
 alwaysApply: true
+description: 项目结构与关键入口（总览）
+---
+## 项目结构与关键入口
+
+- 入口与窗口
+  - 主程序入口：[trace_viewer/app.py](mdc:trace_viewer/app.py)
+  - 窗口类：`TraceViewer`
+  - 启动函数：`main()`
+
+- 右侧值流面板
+  - 模块：[trace_viewer/value_flow.py](mdc:trace_viewer/value_flow.py)
+  - 组件：`ValueFlowDock`
+  - 异步链路：`ChainWorker`
+  - 污点分析：`TaintWorker`
+
+- 解析与索引
+  - 模块：[trace_viewer/trace_parser.py](mdc:trace_viewer/trace_parser.py)
+  - 事件数据：`TraceEvent`
+  - 倒排索引：`addr_index`、`reg_read_index`、`reg_write_index`、`store_addr_index`
+  - 预计算字段：`TraceEvent.effaddr`/`mem_width`/`mem_op`
+  - 复原缓存：`_regs_cache`（LRU）
+
+- 其它
+  - 包声明：[trace_viewer/__init__.py](mdc:trace_viewer/__init__.py)
+  - 项目配置：[pyproject.toml](mdc:pyproject.toml)
+  - 文档：[README.md](mdc:README.md)
+
+约定
+- 耗时操作放后台线程；UI 更新在主线程（见性能规范规则）。
+- 值流点击采用轻量节流（≈80ms）。
+---
+alwaysApply: true
 ---
 # 项目结构与关键入口
 
