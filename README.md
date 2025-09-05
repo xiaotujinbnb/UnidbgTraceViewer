@@ -1,6 +1,8 @@
 # unidbg-trace-tools
 
 Unidbg Trace Viewer 可视化与分析工具（Python 3.8 / PyQt5）。
+界面一览
+<img width="1440" height="863" alt="截屏2025-09-05 12 21 32" src="https://github.com/user-attachments/assets/9bf97edf-e529-4b95-9a05-6f1581b13fe3" />
 
 ## 安装
 
