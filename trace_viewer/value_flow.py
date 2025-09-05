@@ -91,7 +91,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         self.btn_export_python.clicked.connect(self._on_export_c)
         self.btn_export_py = QtWidgets.QPushButton('导出Python代码')
         self.btn_export_py.clicked.connect(self._on_export_py)
-        self.btn_prov = QtWidgets.QPushButton('溯源路径')
+        self.btn_prov = QtWidgets.QPushButton('导出溯源信息')
         self.btn_prov.clicked.connect(self._on_provenance)
         btns.addStretch(1)
         btns.addWidget(self.btn_export_python)
@@ -171,6 +171,13 @@ class ValueFlowDock(QtWidgets.QDockWidget):
             if rw:
                 before = ev.reads.get(reg)
                 after = ev.writes.get(reg)
+                # 兜底补全：必要时使用寄存器复原
+                if before is None or after is None:
+                    fb, fa, _ = self._fallback_before_after(idx, reg)
+                    if before is None:
+                        before = fb
+                    if after is None:
+                        after = fa
                 # 按值匹配（默认执行前）
                 if match_val is not None:
                     b = None if before is None else (before & 0xFFFFFFFF)
@@ -183,7 +190,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                     if side_sel == '任意' and (b != mv and a != mv):
                         continue
                 low8 = self._fmt_low8(reg, idx)
-                bitops = self._fmt_bitops(ev.asm)
+                bitops = self._fmt_c_summary(ev.asm)
                 tag = self._classify_tag(reg, idx)
                 item = QtWidgets.QTreeWidgetItem([
                     str(ev.line_no), f'0x{ev.pc:08x}', rw, tag, ev.asm,
@@ -211,13 +218,16 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 continue
             if lo <= eff <= hi:
                 rw = 'W' if asm.startswith('str') else 'R'
-                # 未指定寄存器的 memory 事件，仅填充调用号
+                # 未指定寄存器的 memory 事件：尝试自动补全前/后值
                 low8 = self._fmt_low8(None, idx)
-                bitops = self._fmt_bitops(ev.asm)
+                bitops = self._fmt_c_summary(ev.asm)
                 tag = self._classify_tag(None, idx)
+                fb, fa, _auto = self._fallback_before_after(idx, None)
                 item = QtWidgets.QTreeWidgetItem([
                     str(ev.line_no), f'0x{ev.pc:08x}', rw, tag, ev.asm,
-                    '', '', str(getattr(ev, 'call_id', 0)), low8, bitops
+                    '' if fb is None else f"0x{fb:08x}",
+                    '' if fa is None else f"0x{fa:08x}",
+                    str(getattr(ev, 'call_id', 0)), low8, bitops
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
                 self.list.addTopLevelItem(item)
@@ -468,6 +478,12 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 ev = self.parser.events[idx]
                 before = ev.reads.get(reg)
                 after = ev.writes.get(reg)
+                if before is None or after is None:
+                    fb, fa, _ = self._fallback_before_after(idx, reg)
+                    if before is None:
+                        before = fb
+                    if after is None:
+                        after = fa
                 rw = 'W' if reg in ev.writes else ('R' if reg in ev.reads else '')
                 asm = self._fmt_with_reg_context(ev, reg, before, after)
                 tag = self._classify_tag(reg, idx)
@@ -476,7 +492,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                     '' if before is None else f"0x{before:08x}",
                     '' if after is None else f"0x{after:08x}",
                     str(getattr(ev, 'call_id', 0)),
-                    self._fmt_low8(reg, idx), self._fmt_bitops(ev.asm)
+                    self._fmt_low8(reg, idx), self._fmt_c_summary(ev.asm)
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
                 self.list.addTopLevelItem(item)
@@ -519,6 +535,19 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         try:
             if self.parser.is_stack_address(idx):
                 return '栈'
+        except Exception:
+            pass
+        # 兜底分类，避免空白
+        try:
+            if s.startswith('ldr'):
+                return '读内存'
+            if s.startswith('str'):
+                return '写内存'
+            if s.startswith(('mov', 'mvn')):
+                return '传送'
+            mnem = s.split(' ', 1)[0]
+            if mnem in ('add','sub','eor','orr','or','and','bic','orn','mul','mla','mls','lsl','lsr','asr','ror'):
+                return '运算'
         except Exception:
             pass
         return ''
@@ -650,7 +679,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
     def _show_save_dialog(self, content: str) -> None:
         # 替换为导出 trace 文本
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle('导出溯源路径为 trace')
+        dlg.setWindowTitle('导出溯源信息为 trace')
         lay = QtWidgets.QVBoxLayout(dlg)
         edit = QtWidgets.QPlainTextEdit()
         edit.setPlainText(content)
@@ -694,6 +723,12 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 ev = self.parser.events[idx]
                 before = ev.reads.get(reg) if reg else None
                 after = ev.writes.get(reg) if reg else None
+                if before is None or after is None:
+                    fb, fa, _ = self._fallback_before_after(idx, reg or None)
+                    if before is None:
+                        before = fb
+                    if after is None:
+                        after = fa
                 asm = self._fmt_with_reg_context(ev, reg, before, after)
                 rw = 'W' if reg in ev.writes else ('R' if reg in ev.reads else '')
                 tag = '[溯源]'
@@ -702,7 +737,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                     '' if before is None else f"0x{before:08x}",
                     '' if after is None else f"0x{after:08x}",
                     str(getattr(ev, 'call_id', 0)),
-                    self._fmt_low8(reg, idx), self._fmt_bitops(ev.asm)
+                    self._fmt_low8(reg, idx), self._fmt_c_summary(ev.asm)
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
                 self.list.addTopLevelItem(item)
@@ -727,18 +762,16 @@ class ValueFlowDock(QtWidgets.QDockWidget):
         for idx in indices:
             ev = self.parser.events[idx]
             raw = ev.raw or ''
-            if not raw:
-                left = ' '.join([f"{k}=0x{v:08x}" for k, v in sorted(ev.reads.items())])
-                right = ' '.join([f"{k}=0x{v:08x}" for k, v in sorted(ev.writes.items())])
-                rest = ''
-                if left and right:
-                    rest = f" {left} => {right}"
-                elif left:
-                    rest = f" {left}"
-                elif right:
-                    rest = f"  => {right}"
-                raw = f"[{ev.timestamp}][{ev.module} {ev.module_offset}] [{ev.encoding}] 0x{ev.pc:08x}: \"{ev.asm}\"{rest}"
-            lines.append(raw)
+            # 只导出“汇编之前”的 trace 内容
+            if raw:
+                try:
+                    prefix = raw.split('"')[0].rstrip()
+                except Exception:
+                    prefix = raw
+            else:
+                # 回退：构造到冒号为止
+                prefix = f"[{ev.timestamp}][{ev.module} {ev.module_offset}] [{ev.encoding}] 0x{ev.pc:08x}:"
+            lines.append(prefix)
         return '\n'.join(lines)
 
     def _parse_taint_inputs(self) -> tuple:
@@ -787,7 +820,7 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 tag = self._classify_tag(None, idx)
                 item = QtWidgets.QTreeWidgetItem([
                     str(ev.line_no), f"0x{ev.pc:08x}", rw, tag, ev.asm,
-                    '', '', str(getattr(ev, 'call_id', 0)), self._fmt_low8(None, idx), self._fmt_bitops(ev.asm)
+                    '', '', str(getattr(ev, 'call_id', 0)), self._fmt_low8(None, idx), self._fmt_c_summary(ev.asm)
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
                 self.list.addTopLevelItem(item)
@@ -927,55 +960,83 @@ class ValueFlowDock(QtWidgets.QDockWidget):
 
     def _fmt_bitops(self, asm: str) -> str:
         s = asm.lower()
-        # 简要识别位运算
         try:
+            # 访存类：不显示
+            if s.startswith('ldr') or s.startswith('str'):
+                return ''
             if s.startswith('mvn'):
-                return '~dst'
+                return '~'
             if s.startswith('eor') or '^' in s:
-                return 'xor'
+                return '^'
             if s.startswith('orr') or ' orr ' in s or s.startswith('or '):
-                return 'or'
+                return '|'
             if s.startswith('and'):
-                return 'and'
+                return '&'
+            if s.startswith('bic'):
+                return '&~'
+            if s.startswith('orn'):
+                return '|~'
+            if s.startswith('add'):
+                return '+'
+            if s.startswith('sub') or s.startswith('rsb'):
+                return '-'
             if 'lsr' in s:
                 return '>>'
             if 'lsl' in s:
                 return '<<'
             if 'asr' in s:
-                return 'asr'
-            if s.startswith('ror') or ' ror ' in s or ' rors ' in s:
-                return 'ror'
-            if s.startswith('ubfx'):
-                return 'ubfx'
-            if s.startswith('sbfx'):
-                return 'sbfx'
-            if s.startswith('bfc'):
-                return 'bfc'
-            if s.startswith('bfi'):
-                return 'bfi'
-            if s.startswith('uxtb'):
-                return 'uxtb'
-            if s.startswith('uxth'):
-                return 'uxth'
-            if s.startswith('sxtb'):
-                return 'sxtb'
-            if s.startswith('sxth'):
-                return 'sxth'
-            if s.startswith('sxtah'):
-                return 'sxtah'
-            if s.startswith('clz'):
-                return 'clz'
-            if s.startswith('rbit'):
-                return 'rbit'
-            if s.startswith('revsh'):
-                return 'revsh'
-            if s.startswith('rev16'):
-                return 'rev16'
-            if s.startswith('rev'):
-                return 'rev'
+                return '>>'
+            # 其它复杂单目/位域等不统一为简写，留空
         except Exception:
             pass
         return ''
+
+    def _fmt_c_summary(self, asm: str) -> str:
+        """更精确的 C 表达式摘要。优先用现有解析 `_bitop_c_expr`，
+        未覆盖/访存类返回空字符串。该函数仅做字符串解析，性能开销极小。"""
+        s = (asm or '').strip().lower()
+        if not s or s.startswith('ldr') or s.startswith('str'):
+            return ''
+        try:
+            expr = self._bitop_c_expr(asm)
+            # 去掉结尾分号，简洁展示
+            if expr and expr.endswith(';'):
+                expr = expr[:-1]
+            return expr or ''
+        except Exception:
+            return ''
+
+    # === 辅助：补全 before/after（必要时自动选择寄存器） ===
+    def _fallback_before_after(self, idx: int, reg: Optional[str]) -> tuple:
+        """当某事件的 reads/writes 没有给出 before/after 时，回退使用寄存器复原补全。
+
+        返回 (before, after, used_reg)。当 reg 为空时，自动选择：
+        - 若仅有一个写寄存器，优先选它；
+        - 否则若仅有一个读寄存器，选它；
+        - 否则返回 (None, None, None)。
+        """
+        try:
+            ev = self.parser.events[idx]
+            use_reg = (reg or '').lower() if reg else None
+            if not use_reg:
+                if len(ev.writes) == 1:
+                    use_reg = next(iter(ev.writes.keys()))
+                elif len(ev.reads) == 1:
+                    use_reg = next(iter(ev.reads.keys()))
+                else:
+                    return None, None, None
+            regs_after = self.parser.reconstruct_regs_at(idx)
+            before = None
+            after = regs_after.get(use_reg)
+            if idx > 0:
+                try:
+                    regs_before = self.parser.reconstruct_regs_at(idx - 1)
+                    before = regs_before.get(use_reg)
+                except Exception:
+                    before = None
+            return before, after, use_reg
+        except Exception:
+            return None, None, None
 
     # === 导出（伪C） ===
     def _on_export_c(self) -> None:

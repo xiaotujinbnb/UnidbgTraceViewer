@@ -33,7 +33,10 @@ class ParserWorker(QtCore.QThread):
 
     def run(self) -> None:
         # 局部导入避免主线程启动开销
-        from .trace_parser import TraceParser  # type: ignore
+        try:
+            from .trace_parser import TraceParser  # type: ignore
+        except Exception:
+            from trace_parser import TraceParser  # type: ignore
         parser = TraceParser(checkpoint_interval=2000)
         try:
             parser.parse_file(self._path, progress_cb=lambda p: self.progress.emit(p))
