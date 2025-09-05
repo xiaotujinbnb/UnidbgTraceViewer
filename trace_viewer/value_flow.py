@@ -706,9 +706,15 @@ class ValueFlowDock(QtWidgets.QDockWidget):
                 ])
                 item.setData(0, QtCore.Qt.UserRole, idx)
                 self.list.addTopLevelItem(item)
-            # 直接导出原始 trace 文本（按执行顺序）
+            # 改为导出“当前列表中所有行”的原始 trace 文本
             try:
-                txt = self._build_trace_text(indices)
+                idxs = []
+                for i in range(self.list.topLevelItemCount()):
+                    it = self.list.topLevelItem(i)
+                    v = it.data(0, QtCore.Qt.UserRole)
+                    if isinstance(v, int):
+                        idxs.append(v)
+                txt = self._build_trace_text(idxs)
                 self._show_save_dialog(txt)
             except Exception:
                 pass
@@ -922,18 +928,53 @@ class ValueFlowDock(QtWidgets.QDockWidget):
     def _fmt_bitops(self, asm: str) -> str:
         s = asm.lower()
         # 简要识别位运算
-        if s.startswith('mvn'):
-            return '~dst'
-        if s.startswith('eor') or '^' in s:
-            return 'xor'
-        if s.startswith('orr') or ' orr ' in s:
-            return 'or'
-        if s.startswith('and'):
-            return 'and'
-        if 'lsr' in s:
-            return '>>'
-        if 'lsl' in s:
-            return '<<'
+        try:
+            if s.startswith('mvn'):
+                return '~dst'
+            if s.startswith('eor') or '^' in s:
+                return 'xor'
+            if s.startswith('orr') or ' orr ' in s or s.startswith('or '):
+                return 'or'
+            if s.startswith('and'):
+                return 'and'
+            if 'lsr' in s:
+                return '>>'
+            if 'lsl' in s:
+                return '<<'
+            if 'asr' in s:
+                return 'asr'
+            if s.startswith('ror') or ' ror ' in s or ' rors ' in s:
+                return 'ror'
+            if s.startswith('ubfx'):
+                return 'ubfx'
+            if s.startswith('sbfx'):
+                return 'sbfx'
+            if s.startswith('bfc'):
+                return 'bfc'
+            if s.startswith('bfi'):
+                return 'bfi'
+            if s.startswith('uxtb'):
+                return 'uxtb'
+            if s.startswith('uxth'):
+                return 'uxth'
+            if s.startswith('sxtb'):
+                return 'sxtb'
+            if s.startswith('sxth'):
+                return 'sxth'
+            if s.startswith('sxtah'):
+                return 'sxtah'
+            if s.startswith('clz'):
+                return 'clz'
+            if s.startswith('rbit'):
+                return 'rbit'
+            if s.startswith('revsh'):
+                return 'revsh'
+            if s.startswith('rev16'):
+                return 'rev16'
+            if s.startswith('rev'):
+                return 'rev'
+        except Exception:
+            pass
         return ''
 
     # === 导出（伪C） ===
